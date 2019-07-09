@@ -1,4 +1,19 @@
 Supplementary materials for Thurman, Barner, Garcia, & Chestnut (2019) Testing the link between species interactions and 
 co-occurrence in a trophic network. Ecography 42: 1–13. doi: 10.1111/ecog.04360
 
-File 1: 
+File 1: Amphibian_Network_code_final.Rmd
+R code for statistical analyses
+
+File 2: Amphibian_community_matrix.csv
+The community matrix (binary; presence/absence) of all species observations
+
+File 3: Environmental_data.csv
+The climate data used to correct for the environment in the odds ratio method of Lane et al (2014) and the Joint Species Distribution
+Model of Golding et al (2015).
+
+Files 4 and 5: bccA.csv and bccB.csv
+The resulting matrix of associations from the JSDM without environmental correction (bccA) and with environmental correction (bccB).
+
+Files 6 and 6: lneA.csv and lneB.csv
+The resulting matrix of associations from the odds ratio method without environmental correction (lneA) and with environmental 
+correction (lneB).
