@@ -1,0 +1,2699 @@
+---
+title: 'Testing the link between species interactions and co-occurrence in a trophic network'
+author: "Thurman L, Barner A, Chestnut T, & T Garcia"
+date: "June 2019"
+output:
+  html_document: default
+  word_document: default
+---
+
+# Load requried packages
+
+``` {r Load required packages, include=TRUE, message=FALSE, warning=FALSE}
+#install.packages('devtools', 'vegan', 'spaa', 'igraph')
+#library(FSA)
+library(devtools)       # to download packages on github repositories; 
+library(betalink)
+library(vegan)          # for community analysis & data manipulation
+library(spaa)           # for data manipulation
+library(igraph)         # to make association network plots
+library(reshape2)
+library(plyr)
+library(dplyr)
+library(NetIndices)
+library(betalink)
+library(GGally)
+#install_github("davharris/rosalia")
+library(rosalia)        # Markov networks
+library(progress)       # required to load rosalia package
+library(corpcor)        # for regularized partial covariance
+library(bipartite)
+library(tibble)
+#install_github('mjwestgate/sppairs')
+library(sppairs)        # odds-ratio method
+library(tidyverse)
+library(simpleboot)     # for bootstrapping simulation statistics
+```
+
+# BENCHMARK ANALYSIS
+
+## Preparing the known interaction networks
+
+``` {r Benchmark analysis pt 1, include=TRUE}
+
+## Constructing a matrix based on known trophic (predator/prey) interactions 
+trophic_rainier <- tibble(AMGR = c(0,0,0,1,0,0,0),
+                        AMMA = c(0,0,1,1,0,1,0),
+                        ANBO = c(0,0,0,1,0,1,0),
+                        PSRE = rep(0, 7),
+                        RAAU = rep(0, 7),
+                        RACA = rep(0, 7),
+                        TAGR = c(rep(1,7)) )
+trophic_rainier <- as.matrix(trophic_rainier)
+rownames(trophic_rainier) <- colnames(trophic_rainier)
+
+trophic_rainier_weighted <- trophic_rainier - t(trophic_rainier) # predation interactions, weighted with - and +
+trophic_rainier_abs <- abs(trophic_rainier_weighted) # predation interactions, absolute values
+trophic_rainier_weighted
+
+## Constructing a matrix based on known competitive interactions
+comp_rainier<- tibble(AMGR = c(0,1,rep(0,4),1),
+                     AMMA = c(1,rep(0,6)),
+                     ANBO = c(0,0,0,1,0,1,0),
+                     PSRE = c(0,0,1,0,1,1,0),
+                     RAAU = c(0,0,0,1,0,0,0),
+                     RACA = c(0,0,1,1,0,0,0),
+                     TAGR = c(1,rep(0,6)) )
+comp_rainier <- as.matrix(comp_rainier)
+rownames(comp_rainier) <- colnames(comp_rainier)
+comp_rainier # competition interactions (absolute values)
+
+# assign each interaction a unique weight
+# 1 = + effect from a trophic interaction
+# 5 = - effect from a trophic interaction
+# 11 = - effect from competition
+
+trophic_rainier_weighted[trophic_rainier_weighted < 0] <- 5 # weighted values for prey
+comp_rainier[comp_rainier != 0] <- 11 # all competitors received the same weight (assuming equal competition)
+
+## Combined trophic/non-trophic network, scenario 1: 
+# Competition is stronger than trophic effects for the predator (so if a predator also competes with its prey, then assume the competitive effect outweighs the benefit of that predation interaction); i.e., competitive effects are always stronger than trophic effects when two species share both interaction types
+# check for conflicts (+ effect from trophic, - effect from competition)
+(scenario1_rainier <- trophic_rainier_weighted + comp_rainier)
+# everywhere the interaction == 12 is where there is a positive trophic effect that conflicts with negative competitive effect. For the prey, when interactions == 16, we can just assume that the interaction is negative regardless of the type of interaction.  
+# everywhere the interaction == 1 is where there is a strictly competitive interaction (no adjustments needed)
+
+scenario1_rainier[scenario1_rainier > 1] <- -1 # everywhere there is a conflict (two types of interactions) will now be negative to represent the stronger effect of competition
+competition_stronger_rainier<-scenario1_rainier
+competition_stronger_rainier
+
+## Combined trophic/non-trophic network, scenario 2: 
+# trophic effects are always stronger than competitive effects when two species share both interaction types
+(scenario2_rainier <- trophic_rainier_weighted + comp_rainier)
+scenario2_rainier[scenario2_rainier == 12] <- 1 # replace where interaction == 12 with a positive effect
+# and then everything else is negative (due to competition or trophic effects on prey)
+scenario2_rainier[scenario2_rainier > 1] <- -1
+predation_stronger_rainier<-scenario2_rainier
+predation_stronger_rainier 
+
+# Known networks to use in analyses:
+# competition_stronger_rainier
+# predation_stronger_rainier
+```
+
+Plot to verify interactions are correct, scenario 1: competition stronger (7 species)
+
+```{r, echo=FALSE}
+# Plot to verify interactions are correct, scenario 1: competition stronger (7 species)
+par(mar=c(2,2,6,2))# bot left top right
+g.comp.known<-graph.adjacency(competition_stronger_rainier, mode="directed",weighted=TRUE,diag=FALSE)
+l<-layout.circle(g.comp.known) 
+l<- layout.norm(l, ymin=-1, ymax=1, xmin=-1, xmax=1) #
+deg<-5 # set the size of your node (species)
+V(g.comp.known)$size<-deg 
+E(g.comp.known)$width<- 3
+E(g.comp.known)[E(g.comp.known)$weight==-1]$color<-"red"  # red for negative interactions
+E(g.comp.known)[E(g.comp.known)$weight==1]$color<-"blue"  # blue for positive interactions
+V(g.comp.known)$color <- "gray80"
+radian.rescale <- function(x, start=0, direction=1) {
+    c.rotate <- function(x) (x + start) %% (2 * pi) * direction
+    c.rotate(scales::rescale(x, c(0, 2 * pi), range(x)))
+  }
+lab.locs <- radian.rescale(x=1:7, direction=-1, start=0) # 7 = number of nodes
+plot(g.comp.known, rescale=FALSE, 
+     layout=l*1.05,
+     #vertex.size=2, 
+     vertex.label.dist=1.5, 
+     vertex.label.degree=lab.locs, 
+     vertex.color="gray80",
+     vertex.label.color="black",
+     vertex.label.family="sans",
+     edge.curved=.05,
+     edge.arrow.size=0.5) # this line controls how big the arrow is
+mtext(text = "Known interactions\n(stronger competition effect)",side = 3,line = 3, cex=1.5)
+```
+
+Plot to verify interactions are correct, scenario 2: predation stronger (7 species)
+
+```{r, echo=FALSE}
+# Plot to verify interactions are correct, scenario 2: predation stronger (7 species)
+par(mar=c(2,2,6,2))# bot left top right
+g.trophic.known<-graph.adjacency(predation_stronger_rainier, mode="directed",weighted=TRUE,diag=FALSE)
+l<-layout.circle(g.trophic.known) 
+l<- layout.norm(l, ymin=-1, ymax=1, xmin=-1, xmax=1) #
+deg<-5 # set the size of your node (species). can set it to be dependent on another
+# variable, like its "centrality" to the network (larger=more central). i didn't do this
+V(g.trophic.known)$size<-deg 
+E(g.trophic.known)$width<- 3
+E(g.trophic.known)[E(g.trophic.known)$weight==-1]$color<-"red"  # red for negative interactions
+E(g.trophic.known)[E(g.trophic.known)$weight==1]$color<-"blue"  # blue for positive interactions
+V(g.trophic.known)$color <- "gray80"
+lab.locs <- radian.rescale(x=1:7, direction=-1, start=0) # 9 = number of nodes
+plot(g.trophic.known, rescale=FALSE, 
+     layout=l*1.05,
+     #vertex.size=2, 
+     vertex.label.dist=1.5, 
+     vertex.label.degree=lab.locs, 
+     vertex.color="gray80",
+     vertex.label.color="black",
+     vertex.label.family="sans",
+     edge.curved=.05,
+     edge.arrow.size=0.5) # this line controls how big the arrow is
+mtext(text = "Known interactions\n(stronger predation effect)",side = 3,line = 3, cex=1.5)
+```
+
+
+
+## Methods comparison
+
+#### Load data
+
+IF YOU ALREADY HAVE THE "Amphibian_community_matrix.csv" and "Environmental_data.csv" FILES, SKIP TO NEXT SECTION
+
+``` {r Benchmark analysis pt 2a, include=TRUE, eval=FALSE}
+# Load the amphibian co-occurrence data
+MORA.Lentic <- read.csv('E:/Dissertation/Ch 4/MORA_Amphibians_Lentic_CSV_033117.csv', header=T)
+# head(M)
+# Step 1: reduce the dataframe to just columns of Sample and SpeciesCode
+# columns 4 and 18 of 22
+MORA.Lentic2 <- MORA.Lentic[ , -c(1:3,5:17,19:26) ] # 4738 observations (all samples)
+colnames(MORA.Lentic2)
+
+# Step 2: make the boolean matrix   
+w <- melt(MORA.Lentic2) # 4738 observations (all samples), doesn't really change anything
+w <- dcast(w, Sample~SpeciesCod) # 583 samples (aggregated); col 1 = sample, cols 2:8 = species
+w[is.na(w)] <- 0        # assigns all NA values a 0
+w2 <- cbind(apply(w[,2:8], 2, function(w) as.numeric(w > 0)), w[1])  # converts to presence (=1)/absence (=0);
+# 7 species columns; applies function only to numeric columns; binds first column (Sample) 
+MORA.Len.matrix <- w2[,c(8, 1:7)]  # rearrange so that Sample column is first
+
+#write.csv(MORA.Len.matrix, file = "Amphibian_community_matrix.csv", row.names=FALSE)
+
+# Load the climate data to be used in odds-ratios and BJSDM models
+# Climate data
+ENV <- MORA.Lentic[ , -c(1:11,16,17,19:22) ] # climate data and Sample (unique site-year combo)
+ENV <- melt(ENV)
+ENV <- dcast(ENV, Sample~variable, fun.aggregate = mean) # multiple observations per sample; take mean of variable per sample
+
+#write.csv(ENV, file = "Environmental_data.csv", row.names=FALSE)
+```
+
+Load anonymized data
+
+``` {r Benchmark analysis pt 2b, include=TRUE}
+# Load the amphibian community matrix (make sure to set WD)
+MORA.Len.df <- read.csv("Amphibian_community_matrix.csv", header=T)
+
+X <- MORA.Len.df[ , -1 ] # remove Sample (factor) column
+X <- as.matrix(sapply(X, as.numeric))  # convert to matrix
+
+# Load climate (environmental) data
+ENV.df <- read.csv("Environmental_data.csv", header=T)
+
+ENV <- ENV.df[ , -1 ] # remove Sample (factor) column
+ENV <- as.matrix(sapply(ENV, as.numeric))  # convert to matrix
+
+```
+
+Joint proportion of co-occurrence
+
+```{r}
+total_occurrences <- colSums(X)
+total_occurrences
+data_matrix <- as.matrix(X)
+co_occurrence.mora <- t(data_matrix) %*% data_matrix # transpose the matrix
+co_occurrence.mora
+
+# pJ= nS/(nA+nB+ nS)
+
+# joint proportions of co-occurrence (i.e. the proportion of shared samples out of total possible samples for each species pair). 
+# e.g. AMGR and AMMA 
+# AMGR occurrences in the absence of AMMA:
+407-110 # total AMGR occurrences minus their shared co-occurrence 
+# AMMA occurrences in the absence of AMGR:
+165-110 # total AMMA occurrences minus their shared co-occurrence 
+# where AMGR and AMMA co-occur
+110
+# joint probability of co-occurrence
+110/((407-110)+(165-110)+110)
+# or...
+110/(407+165-110) # 0.2380952
+
+# now do this automatically and create a joint proportion of occurrence matrix
+# co-occurrence as a joint proportion between each species pair...
+cooccurr.prop.mora <-  matrix(, nrow = 7, ncol = 7) # create an empty 7x7 matrix
+for (j in 1:7) { 
+    for (i in 1:7) {
+  cooccurr.prop.mora[i,j] <- co_occurrence.mora[i,j]/(co_occurrence.mora[i,i] + 
+                        co_occurrence.mora[j,j] - co_occurrence.mora[i,j]) 
+}}
+colnames(cooccurr.prop.mora)<-colnames(co_occurrence.mora)
+rownames(cooccurr.prop.mora)<-colnames(co_occurrence.mora)
+print(cooccurr.prop.mora)
+
+# plot 
+g<-graph.adjacency(cooccurr.prop.mora, mode="undirected",weighted=TRUE,diag=FALSE)
+l<-layout.circle(g) 
+l<- layout.norm(l, ymin=-1, ymax=1, xmin=-1, xmax=1) 
+deg<-5 
+V(g)$size<-deg 
+# V(g)$label<-NA # can add species names here
+E(g)$width<-(abs(E(g)$weight)/max(abs(E(g)$weight)))*5
+E(g)[E(g)$weight>0]$color<-"black" # all species co-occur at least once
+V(g)$color <- "gray80"
+radian.rescale <- function(x, start=0, direction=1) {
+  c.rotate <- function(x) (x + start) %% (2 * pi) * direction
+  c.rotate(scales::rescale(x, c(0, 2 * pi), range(x)))
+}
+lab.locs <- radian.rescale(x=1:7, direction=-1, start=0) # 7 = number of nodes
+plot(g, rescale=FALSE, 
+     layout=l*1.05,
+     vertex.label.dist=1, 
+     vertex.label.degree=lab.locs, 
+     vertex.color="gray80",
+     vertex.label.color="black",
+     vertex.label.family="sans") 
+#mtext(text = "Raw co-occurrences",side = 3,line = 2, cex=1.5) 
+```
+
+#### Odds ratio without evironmental correction
+
+NOTE: THIS MODEL TAKES A WHILE TO RUN, IF YOU ALREADY HAVE "lneA.csv" FILE, SKIP TO LOADING "lneA.csv"
+
+```{r, eval=FALSE}
+
+# 'clean' data as per Lane et al. recommendation (no very rare or very abundant species)
+X.clean<-clean.dataset(X, cutoff.min=0.1, cutoff.max=0.95)
+dim(X);dim(X.clean)
+# got rid of 2 out of 7 spp: ANBO and RAAU (considered rare)
+
+# calculate odds ratio from logistic regression
+lne.pr.A<-spaa(X.clean, method="or.glm")
+
+lne.pr.A # value = odds ratio, degree of association
+
+(sigpair.lne<-nrow(lne.pr.A)) # how many significant pairs?
+which(lne.pr.A$value > 1) # which pairs are positive associations?
+length(which(lne.pr.A$value > 1))/sigpair.lne # what proportion are positive? 
+which(lne.pr.A$value < 1) # which pairs are negative associations?
+length(which(lne.pr.A$value < 1))/sigpair.lne # what proportion are negative? 
+
+# Note: Lane et al suggest that an odds ratio > or < 3 (rather than 1) represents an "ecologically substantial association". In this case, the only *significantly* positive or "indicated" association is between PSRE and TAGR
+
+# make a full association ("A") matrix with significant & nonsig assoc
+ncol(X) 
+# how many unique species are listed in the pairwise list?
+lnestk<-data.frame()
+lnestk[1:nrow(lne.pr.A),1]<-lne.pr.A$sp1
+lnestk[(nrow(lne.pr.A)+1):((nrow(lne.pr.A)+1)+(nrow(lne.pr.A))-1),1]<-lne.pr.A$sp2
+length(unique(lnestk$V1))
+
+# need to add on extra species that weren't significant
+length(which(colnames(X) %in% unique(lnestk$V1)==FALSE))
+colnames(X)[which(colnames(X) %in% unique(lnestk$V1)==FALSE)]
+lne.pr.df<-data.frame(lne.pr.A$sp1,lne.pr.A$sp2, lne.pr.A$value, stringsAsFactors = FALSE)
+# add on NA values
+lne.pr.df[(nrow(lne.pr.df)+1):
+         (nrow(lne.pr.df)+length(which(colnames(X) %in% unique(lnestk$V1)==FALSE))),
+         1:2]<- cbind(colnames(X)[which(colnames(X) %in% unique(lnestk$V1)==FALSE)],
+         rev(colnames(X)[which(colnames(X) %in% unique(lnestk$V1)==FALSE)]))
+
+# for directed links (e.g., lane et al. 2014 method used here)
+list2mat_dir<-function (dat){ 
+  dat.name1 <- as.character(dat[, 1])
+  dat.name2 <- as.character(dat[, 2])
+  dat.value <- dat[, 3]
+  names1 <- sort(unique(as.character(dat[, 1])))
+  names2 <- sort(unique(as.character(dat[, 2])))
+  total.names <- unique(c(names1, names2))
+  elements <- rep(NA, length(total.names)^2)
+  dim(elements) <- c(length(total.names), length(total.names))
+  rownames(elements) <- total.names
+  colnames(elements) <- total.names
+  for (k in 1:length(dat.name1)) {
+    elements[dat.name1[k], dat.name2[k]] <- dat.value[k]}
+  return(elements)
+}
+
+lne.A<-as.matrix(list2mat_dir(lne.pr.df))
+dim(lne.A)
+lne.A[is.na(lne.A)]<-0 # replace NAs with 0s
+
+# check: is the A matrix symmetric? (it shouldn't be)
+isSymmetric(lne.A) 
+
+#write.csv(lne.A, file = "lneA.csv", row.names = FALSE)
+```
+
+To load in lne.A matrix, rather than re-running the model (which takes a while):
+
+```{r}
+lne.A<-read.csv("lneA.csv", header = T)
+lne.A<-as.matrix(lne.A)
+rownames(lne.A) <- colnames(lne.A)
+lne.A
+```
+
+```{r}
+# convert to pairwise distances
+lneA.dist <- t(combn(colnames(lne.A), 2))
+lneA.dist<-data.frame(lneA.dist, dist=lne.A[lneA.dist])
+colnames(lneA.dist)[1] <- "sp1"
+colnames(lneA.dist)[2] <- "sp2"
+# remove rows with dist=0
+lneA.dist<-lneA.dist[apply(lneA.dist[3], 1, function(x) !all(x==0)),] # apply to dist column 3
+lneA.dist
+```
+
+#### Odds ratio with environmental correction
+
+NOTE: THIS MODEL TAKES A WHILE TO RUN, IF YOU ALREADY HAVE "lneB.csv" FILE, SKIP TO LOADING "lneB.csv"
+
+```{r, eval=FALSE}
+library(clustsig)       # to run the simprof() clustering function
+library(cluster)
+library(fpc)
+
+# run cluster analysis
+alpha <- 0.05
+
+View(ENV)
+res <- simprof(data=ENV, method.distance="braycurtis", alpha=alpha)
+# note: this runs for a long time
+# res shows the samples and where they fall into the various clusters
+
+pl.color <- simprof.plot(res, plot=T) # 'dendrogram' with 2 branches and 584 members total, at height 20.90772 
+plot (pl.color, ylab="Bray-Curtis dissimilarity (%)") # different colors are significant (at alpha 0.05) differences in env conditions
+
+res$numgroups # how many clusters of environmental variables detected?
+
+# convert to a factor list
+sigclus<-ldply(res$significantclusters, data.frame)
+clusleng<-ldply(lapply(res$significantclusters, length), data.frame) 
+View(clusleng)
+# 77 of the 229 clusters only have 1 sample (observation), which won't work at the level of a random effect, so they have to be combined. 
+
+library(dendextend)
+# calculate lowest value of h in cut that produces groupings of a given minimum size
+dend<-as.dendrogram(res$hclust)
+heights_per_k.dendrogram(dend)
+# we know that 277 clusters results in many clusters with singletons. The height at k=277 clusters is 4.980546e-02
+
+res_cut<-cutree(res$hclust, h=4.443017e-01) # cut tree to give 100 clusters 
+res_cut # gives cluster assignment for each sample
+res_cut<-as.factor(res_cut) # convert cluster list to a factor
+cut.table = table(res_cut) # convert to a table, which will give frequencies for each level
+cut.table<-as.data.frame(cut.table) # convert to data_frame
+names(cut.table)[1] = 'cluster' # 1st column renamed cluster
+View(cut.table)
+# still have 20 clusters with singletons
+
+# repeated the above code to incrementally reduce the number of clusters until there are no more singletons (k=18 achieved this for our data) 
+res_cut<-dendextend::cutree(res$hclust, k=18) # h=2.516257
+# res_cut shows the cluster that each sample assigned to (from 1 to 18)
+
+# view this clustering on the dendrogram
+res$hclust <- color_branches(res$hclust, k = 18) 
+res$hclust <- color_labels(res$hclust, k = 18)
+plot(res$hclust)
+
+# convert to a factor list
+sigclus<-ldply(res_cut, data.frame)
+View(sigclus)
+names(sigclus)[2] = 'cluster' # 1st column is the cluster
+
+# calculate odds ratio from logistic regression and include random environmental effect from cluster analysis
+lne.pr.B<-spaa(X.clean, method="or.glmer", random.effect=sigclus$cluster)
+
+(sigpair.lne<-nrow(lne.pr.B)) # how many significant pairs?
+which(lne.pr.B$value > 1) # which pairs are positive associations?
+which(lne.pr.B$value < 1) # which pairs are negative associations?
+length(which(lne.pr.B$value < 1))/sigpair.lne # what proportion are negative? 
+
+# make a full association ("A") matrix with significant & nonsig assoc
+ncol(X) 
+# how many unique species are listed in the pairwise list?
+lnestk<-data.frame()
+lnestk[1:nrow(lne.pr.B),1]<-lne.pr.B$sp1
+lnestk[(nrow(lne.pr.B)+1):((nrow(lne.pr.B)+1)+(nrow(lne.pr.B))-1),1]<-lne.pr.B$sp2
+length(unique(lnestk$V1))
+
+# need to add on extra species that weren't significant
+length(which(colnames(X) %in% unique(lnestk$V1)==FALSE))
+colnames(X)[which(colnames(X) %in% unique(lnestk$V1)==FALSE)]
+lne.pr.df<-data.frame(lne.pr.B$sp1,lne.pr.B$sp2, lne.pr.B$value, stringsAsFactors = FALSE)
+#  add on NA values
+lne.pr.df[(nrow(lne.pr.df)+1):
+         (nrow(lne.pr.df)+length(which(colnames(X) %in% unique(lnestk$V1)==FALSE))),
+         1:2]<- cbind(colnames(X)[which(colnames(X) %in% unique(lnestk$V1)==FALSE)],
+         rev(colnames(X)[which(colnames(X) %in% unique(lnestk$V1)==FALSE)]))
+
+lne.B<-as.matrix(list2mat_dir(lne.pr.df))
+dim(lne.B)
+# replace NAs with 0s
+lne.B[is.na(lne.B)]<-0 
+
+# check: is the B matrix symmetric? (it shouldn't be)
+isSymmetric(lne.B) 
+
+#write.csv(lne.B, file = "lneB.csv", row.names = FALSE)
+```
+
+To load in lne.B matrix, rather than re-running the model (which takes a while):
+
+```{r}
+lne.B<-read.csv("lneB.csv", header = T)
+lne.B<-as.matrix(lne.B)
+rownames(lne.B) <- colnames(lne.B)
+lne.B
+```
+
+```{r}
+# convert to pairwise distances
+lneB.dist <- t(combn(colnames(lne.B), 2))
+lneB.dist<-data.frame(lneB.dist, dist=lne.B[lneB.dist])
+colnames(lneB.dist)[1] <- "sp1"
+colnames(lneB.dist)[2] <- "sp2"
+# remove rows with dist=0
+lneB.dist<-lneB.dist[apply(lneB.dist[3], 1, function(x) !all(x==0)),] # apply to dist column 3
+lneB.dist
+```
+
+#### Markov network
+
+Function rosalia() developed in Harris 2016 is arguably the best-performing method to evaluate "true" direct interactions (rather than estimating net effects), with partial covariance as the second best-performing method for - for speciose (S > 20) communities of intermediate sample size (N = ~100), which best matches the form of our community data (Harris 2016).
+
+```{r}
+hros <- rosalia(X) # run rosalia function (with no prior)
+hros.A<-hros$beta # returns 'interaction strengths'
+colnames(hros.A)<-colnames(X)
+rownames(hros.A)<-colnames(X)
+hros.A
+```
+
+```{r}
+# convert to pairwise distances
+hrosA.dist <- t(combn(colnames(hros.A), 2))
+hrosA.dist<-data.frame(hrosA.dist, dist=hros.A[hrosA.dist])
+colnames(hrosA.dist)[1] <- "sp1"
+colnames(hrosA.dist)[2] <- "sp2"
+hrosA.dist
+```
+
+#### Partial correlation
+
+According to Harris (2016): "For cases where fitting a Markov network is computationally infeasible, these results also indicate that partial covariances...can often provide a surprisingly useful approximation". To increase their reliability, Harris (2016) suggests adding a guild structure as a prior distribution on the parameters.
+
+````{r}
+# two ways to calculate partial correlation:
+# pcva <- corpcor::pcor.shrink(X) 
+pcvb <- cor2pcor(cor(X)) # slower than pcor.shrink
+
+# note that the blonder & morueta-holme package 'netassoc' calculates partial correlation to estimate associations, using corpcor::invcov.shrink() (see ?partial_correlation) to calculate the inverse covariance matrix, which is then used to estimate partial correlations, whereas corpcor::cor2pcor() uses the pseudoinverse() function to invert the covariance matrix
+
+colnames(pcvb)<-colnames(X)
+rownames(pcvb)<-colnames(X)
+pcvb
+```
+
+```{r}
+# convert to pairwise distances
+pcvb.dist <- t(combn(colnames(pcvb), 2))
+pcvb.dist<-data.frame(pcvb.dist, dist=pcvb[pcvb.dist])
+colnames(pcvb.dist)[1] <- "sp1"
+colnames(pcvb.dist)[2] <- "sp2"
+pcvb.dist
+```
+
+#### JSDM without evironmental correction
+
+NOTE: THIS MODEL TAKES A WHILE TO RUN, IF YOU ALREADY HAVE "bccA.csv" FILE, SKIP TO LOADING "bccA.csv"
+
+```{r, eval=FALSE}
+# notes about running the BC() function :  
+which(is.na(X)) # you cannot have any NA rows or columns
+which(apply(X = X, MARGIN = 2, FUN = sum)==0) # you cannot have any empty rows or columns (no empty samples or species)
+which(apply(X = X, MARGIN = 1, FUN = sum)==0)
+which(apply(X = X, MARGIN = 2, FUN = sum)==nrow(X)) # you cannot have columns of all 1's
+ncol(X)<nrow(X) # must have number of species < number of samples
+Xmat<-as.matrix(X) # all objects must be a matrix (not data frame)
+Xmat<-matrix(Xmat, ncol=ncol(Xmat), dimnames=NULL) # remove names
+
+# you can add priors, if desired
+# can easily run BC with and without accounting for the environment, by only using a different specification of the "model" argument
+
+bcc <- BC(Xmat, model="community", its=1000)
+# in the absence of any other specificiations, it uses these default settings (from the BCfit function): an inverse WIshart prior, a form of "uniformative"priors (Pollock et al. 2014 talk about it a little)
+
+# create a dataframe with just the posterior correlation matrix ('interactions')
+bcc_cor<-bcc$trace["R"]$R
+# so what are these? you can get a good idea of what this is by looking at...
+head(bcc_cor)
+str(bcc_cor)
+# For each species pair, these are the posterior correlations from each iteration of the model (its=1000, as we set above), without any thinning. Recall that in bayesian modeling, estimates from the model are *distributions*. So for each species pairs, there's an estimated ('posterior') distribution of its interaction strength. The way to estimate what that interaction is would be to look at the credible intervals (most people use 90%) to see if they cross 0, which would indicate that the interaction strenghts are no different from 0.
+
+# what are the means? create a vector of mean correlations
+bcc_cor_mean<-data.frame(apply(X = bcc_cor, MARGIN = 2, FUN = mean))
+colnames(bcc_cor_mean)<-"mean_correlations"
+# what are the standard deviations?
+bcc_cor_sd<-data.frame(apply(X = bcc_cor, MARGIN = 2, FUN = sd))
+colnames(bcc_cor_sd)<-"sd_correlations"
+# get 90 % credible intervals (lower and upper limit for each pair)
+bcc_cor_p<-apply(bcc_cor, 2, FUN = function(x) {quantile(x, c(0.05, 0.95))})
+# which don't cross 0?
+bcc_sub<-which(bcc_cor_p[1,]<0&bcc_cor_p[2,]<0|bcc_cor_p[1,]>0&bcc_cor_p[2,]>0)
+bcc_len<-1:nrow(bcc_cor_mean)
+# which species are the ones that have 90% CIs that don't cross 0?
+bcc_sub_df<-as.data.frame(bcc_sub)
+colnames(bcc_sub_df)<-"index"
+bcc_sub_df2<-data.frame(bcc_sub_df, t(as.data.frame(strsplit(rownames(bcc_sub_df), "_"))))
+colnames(bcc_sub_df2)[2:3]<-c("sp1","sp2")
+bcc_sub_df2$sp1<-substring(bcc_sub_df2$sp1,3) # takes number from 3rd position
+bcc_sub_df2$sp2<-substring(bcc_sub_df2$sp2,3)
+bcc_sub_df3<-transform(bcc_sub_df2, sp1=as.numeric(sp1), sp2=as.numeric(sp2))
+# get species numbers
+bcc_sub_df3$sp1_name<-NA
+bcc_sub_df3$sp2_name<-NA
+for (i in 1:nrow(bcc_sub_df3)) {
+  sp_mat_tmp<-colnames(X)
+  bcc_sub_df3$sp1_name[i]<-sp_mat_tmp[bcc_sub_df3$sp1[i]]
+  bcc_sub_df3$sp2_name[i]<-sp_mat_tmp[bcc_sub_df3$sp2[i]]
+}
+# add in the intervals & mean
+(bcc_sig<-data.frame(bcc_sub_df3, t(bcc_cor_p[,bcc_sub]), bcc_cor_mean[bcc_sub,]))
+colnames(bcc_sig)[ncol(bcc_sig)]<-"mean"
+# make a full association ("A") matrix with significant & nonsignificant associations
+# how many unique species are listed in the pairwise list?
+stk<-data.frame() # create a df with a column that stacks sp1_name and sp2_name
+stk[1:nrow(bcc_sig),1]<-bcc_sig$sp1_name
+stk[(nrow(bcc_sig)+1):((nrow(bcc_sig)+1)+(nrow(bcc_sig))-1),1]<-bcc_sig$sp2_name
+# need to add on extra species that weren't significant
+bccA_sig.df<-data.frame(bcc_sig$sp1_name,bcc_sig$sp2_name,bcc_sig$mean, 
+                        stringsAsFactors = FALSE) 
+bccA.dist<-bccA_sig.df
+#  add on NA values
+bccA_sig.df[(nrow(bccA_sig.df)+1):
+             (nrow(bccA_sig.df)+length(which(colnames(X) %in% unique(stk$V1)==FALSE))),
+           1:2]<- cbind(colnames(X)[which(colnames(X) %in% unique(stk$V1)==FALSE)],
+                        rev(colnames(X)[which(colnames(X) %in% unique(stk$V1)==FALSE)]))
+
+list2matrix<-function (dat){ 
+  dat.name1 <- as.character(dat[, 1])
+  dat.name2 <- as.character(dat[, 2])
+  dat.value <- dat[, 3]
+  names1 <- sort(unique(as.character(dat[, 1])))
+  names2 <- sort(unique(as.character(dat[, 2])))
+  total.names <- unique(c(names1, names2))
+  elements <- rep(NA, length(total.names)^2)
+  dim(elements) <- c(length(total.names), length(total.names))
+  rownames(elements) <- total.names
+  colnames(elements) <- total.names
+  for (k in 1:length(dat.name1)) {
+    elements[dat.name1[k], dat.name2[k]] <- dat.value[k]}
+  # make symmetric
+  elements2<-t(elements)
+  elements[which(is.na(elements) & upper.tri(elements))] <- elements2[which(is.na(elements) & upper.tri(elements))]
+  elements[lower.tri(elements)]<- NA
+  elements3<-Matrix::forceSymmetric(elements, "U")
+  return(elements3)
+}
+
+bcc.A<-as.matrix(list2matrix(bccA_sig.df))
+dim(bcc.A)
+# replace NAs with 0s
+bcc.A[is.na(bcc.A)]<-0 
+# is the A matrix symmetric?
+isSymmetric(bcc.A) # yes
+
+bcc.A <- bcc.A[order(rownames(bcc.A)),] # order the rows alphabetically
+bcc.A <- bcc.A[,order(colnames(bcc.A))] # order the columns alphabetically
+View(bcc.A)
+
+#write.csv(bcc.A, file = "bccA.csv", row.names = FALSE)
+```
+
+To load in bcc.A matrix, rather than re-running the model (which takes a while):
+
+```{r}
+bcc.A<-read.csv("bccA.csv", header=T)
+bcc.A<-as.matrix(bcc.A)
+rownames(bcc.A) <- colnames(bcc.A)
+bcc.A
+```
+
+```{r}
+# convert to pairwise distances
+bccA.dist <- t(combn(colnames(bcc.A), 2))
+bccA.dist<-data.frame(bccA.dist, dist=bcc.A[bccA.dist])
+colnames(bccA.dist)[1] <- "sp1"
+colnames(bccA.dist)[2] <- "sp2"
+# remove rows with dist=0
+bccA.dist<-bccA.dist[apply(bccA.dist[3], 1, function(x) !all(x==0)),] # apply to dist column 3
+bccA.dist
+```
+
+#### JSDM with environmental correction
+
+NOTE: THIS MODEL TAKES A WHILE TO RUN, IF YOU ALREADY HAVE "bccA.csv" FILE, SKIP TO LOADING "bccA.csv"
+
+```{r, eval=FALSE}
+# environmental matrix  
+ENVmat <- scale(ENV) # scale environmental predictors
+
+# covariates list
+# create a new dataframe with environmental covariates, which in this case is the same thing as the df for ENV, but scaled 
+env.df <- data.frame(ENVmat)
+str(env.df)
+
+# run forward stepwise selection across all covariates for each species, select the model that gives the lowest AIC and tabulate which covariates were selected
+# create matrix of results (whether covariate was selected)
+res2 <- matrix(0, ncol(Xmat), ncol(ENVmat))
+colnames(res2) <- colnames(ENVmat)
+rownames(res2) <- colnames(Xmat)
+# rows are species, columns are predictors
+
+# an empty list for the selected models
+mods <- list()
+
+# run the selection and record results for each species
+for (i in 1:ncol(Xmat)) {
+  # starting model (intercept only)
+  mlow <- glm(Xmat[, i] ~ 1,
+              data = env.df, family = binomial(link = "probit"))
+  # potential final model (includes all covariates)
+  mup <- glm(Xmat[, i] ~.,
+             data = env.df, family = binomial(link = "probit"))
+  # run model selection
+  s <- step(mlow, formula(mup), direction = "forward")
+  # add selected model to the list
+  mods <- c(mods, list(s))
+  # get the names of the selected coefficients and update the results matrix
+  sel <- names(s$coefficients)
+  ind <- (1:length(sel))[-grep('\\(', sel)]
+  #  ind <- which(substring(sel, 1, 4) == "Comp")
+  #   nos <- as.numeric(substring(sel[ind], 6, 7))
+  res2[i, sel[ind]] <- 1
+  #   res2[i, nos] <- 1
+}
+
+res2 # matrix indicating whether a variable was selected
+     
+sort(colSums(res2), decreasing = TRUE) # number of times each component was selected for a species
+
+# create a list of the components to use for each species in the modelling
+covlist <- apply(res2, 1, function(x) which(as.logical(x)))
+covlist
+
+# set the number of iterations
+iterations <- 1000
+
+# now run the models!
+# (warning: the following take several minutes to run and can be quite memory-intensive, hence the thinning)
+
+# null model (ignores X; intercept only)
+	bcc.null <- BC(Y = Xmat, X = ENVmat, model = "null",
+		covlist = covlist,
+    #condition = conditioning,
+		its = iterations, 
+		#burn = burnin, thin = thin)
+     )
+# check convergence
+plot(bcc.null, 'B$AMGR')
+
+# community model
+bcc.comm <- BC(Y = Xmat, X = ENVmat, model = "community",
+		covlist = covlist,
+    #condition = conditioning,
+		its = iterations, 
+		#burn = burnin, thin = thin)
+     )
+# check convergence
+plot(bcc.comm, 'B$AMGR')
+plot(bcc.comm, 'R')
+
+# environment model
+bcc.env <- BC(Y = Xmat, X = ENVmat, model = "environment",
+		covlist = covlist,
+    #condition = conditioning,
+		its = iterations, 
+		#burn = burnin, thin = thin)
+     )
+plot(bcc.env, 'B$AMGR')
+
+
+# full model
+bcc.full <- BC(Y = Xmat, X = ENVmat, model = "full",
+		covlist = covlist,
+    #condition = conditioning,
+		its = iterations, 
+		#burn = burnin, thin = thin)
+     )
+# check convergence
+par(mar = c(4, 3, 3, 1) + 0.1)
+plot(bcc.full, 'B$AMGR')
+plot(bcc.full, 'R')
+  
+# create a dataframe with just the posterior correlation matrix ('interactions')
+bcc_cor2<-bcc.full$trace["R"]$R
+# so what are these? you can get a good idea of what this is by looking at...
+head(bcc_cor2)
+str(bcc_cor2)
+# For each species pair, these are the posterior correlations from each iteration of the model (its=1000, as we set above), without any thinning. Recall that in Bayesian modeling, estimates from the model are *distributions*. So for each species pair, there's an estimated ('posterior') distribution of its interaction strength. The way to estimate what that interaction is would be to look at the credible intervals (most people use 90%) to see if they cross 0, which would indicate that the interaction strenghts are no different from 0.
+
+# what are the means? create a vector of mean correlations
+bcc_cor_mean<-data.frame(apply(X = bcc_cor2, MARGIN = 2, FUN = mean))
+colnames(bcc_cor_mean)<-"mean_correlations"
+# what are the standard deviations?
+bcc_cor_sd<-data.frame(apply(X = bcc_cor2, MARGIN = 2, FUN = sd))
+colnames(bcc_cor_sd)<-"sd_correlations"
+# get 90 % credible intervals (lower and upper limit for each pair)
+bcc_cor_p<-apply(bcc_cor2, 2, FUN = function(x) {quantile(x, c(0.05, 0.95))})
+# which don't cross 0?
+bcc_sub<-which(bcc_cor_p[1,]<0&bcc_cor_p[2,]<0|bcc_cor_p[1,]>0&bcc_cor_p[2,]>0)
+bcc_len<-1:nrow(bcc_cor_mean)
+# which species are the ones that have 90% CIs that don't cross 0?
+bcc_sub_df<-as.data.frame(bcc_sub)
+colnames(bcc_sub_df)<-"index"
+bcc_sub_df2<-data.frame(bcc_sub_df, t(as.data.frame(strsplit(rownames(bcc_sub_df), "_"))))
+colnames(bcc_sub_df2)[2:3]<-c("sp1","sp2")
+bcc_sub_df2$sp1<-substring(bcc_sub_df2$sp1,3) # takes number from 3rd position
+bcc_sub_df2$sp2<-substring(bcc_sub_df2$sp2,3)
+bcc_sub_df3<-transform(bcc_sub_df2, sp1=as.numeric(sp1), sp2=as.numeric(sp2))
+# get species numbers
+bcc_sub_df3$sp1_name<-NA
+bcc_sub_df3$sp2_name<-NA
+for (i in 1:nrow(bcc_sub_df3)) {
+  sp_mat_tmp<-colnames(X)
+  bcc_sub_df3$sp1_name[i]<-sp_mat_tmp[bcc_sub_df3$sp1[i]]
+  bcc_sub_df3$sp2_name[i]<-sp_mat_tmp[bcc_sub_df3$sp2[i]]
+}
+# add in the intervals & mean
+(bcc_sig<-data.frame(bcc_sub_df3, t(bcc_cor_p[,bcc_sub]), bcc_cor_mean[bcc_sub,]))
+colnames(bcc_sig)[ncol(bcc_sig)]<-"mean"
+# make a full association ("A") matrix with significant & nonsig assoc
+# how many unique species are listed in the pairwise list?
+stk<-data.frame() # create a df with a column that stacks sp1_name and sp2_name
+stk[1:nrow(bcc_sig),1]<-bcc_sig$sp1_name
+stk[(nrow(bcc_sig)+1):((nrow(bcc_sig)+1)+(nrow(bcc_sig))-1),1]<-bcc_sig$sp2_name
+# need to add on extra species that weren't significant
+bccB_sig.df<-data.frame(bcc_sig$sp1_name,bcc_sig$sp2_name,bcc_sig$mean, 
+                        stringsAsFactors = FALSE) 
+bccB.dist<-bccB_sig.df ## USE THIS FOR SIG PAIRWISE INTXNS 
+                       ## IN NETWORK COMPARISONS SECTION
+#  add on NA values
+bccB_sig.df[(nrow(bccB_sig.df)+1):
+           (nrow(bccB_sig.df)+length(which(colnames(X) %in% unique(stk$V1)==FALSE))),
+           1:2]<- cbind(colnames(X)[which(colnames(X) %in% unique(stk$V1)==FALSE)],
+           rev(colnames(X)[which(colnames(X) %in% unique(stk$V1)==FALSE)]))
+
+bcc.B<-as.matrix(list2matrix(bccB_sig.df)) # see list2matrix function in previous section (bcc.A)
+dim(bcc.B)
+# replace NAs with 0s
+bcc.B[is.na(bcc.B)]<-0 
+# is the A matrix symmetric?
+isSymmetric(bcc.B) # yes
+
+#write.csv(bcc.B, file = "bccB.csv", row.names = FALSE)
+```
+
+To load in bcc.B matrix, rather than re-running the model (which takes a while):
+
+```{r}
+bcc.B<-read.csv("bccB.csv", header=T)
+bcc.B<-as.matrix(bcc.B)
+rownames(bcc.B) <- colnames(bcc.B)
+bcc.B
+```
+
+```{r}
+# convert to pairwise distances
+bccB.dist <- t(combn(colnames(bcc.B), 2))
+bccB.dist<-data.frame(bccB.dist, dist=bcc.B[bccB.dist])
+colnames(bccB.dist)[1] <- "sp1"
+colnames(bccB.dist)[2] <- "sp2"
+# remove rows with dist=0
+bccB.dist<-bccB.dist[apply(bccB.dist[3], 1, function(x) !all(x==0)),] # apply to dist column 3
+bccB.dist
+```
+
+## Standardize outputs from each association method
+
+Make adjancency matrices, with only -1,1,0
+
+```{r Benchmark analysis pt 3, include=TRUE}
+# significance of odds ratio methods are based on > or < 1 (bounded at 0), 
+# so to convert to a comparable binary adjacency matrix, have to convert... 
+lneA.adj <-  matrix(, nrow = 7, ncol = 7) # create an empty 7 x 7 matrix
+lneA.adj[lne.A < 1 & lne.A > 0] = -1 # if less than 1 (but > 0), then -1
+lneA.adj[lne.A >= 1 ] = 1 # if greater than 1, then 1
+lneA.adj[lne.A == 0 ] = 0 # if 0, then 0
+colnames(lneA.adj)<-colnames(lne.A) 
+rownames(lneA.adj)<-colnames(lne.A)
+lneA.adj<-as.matrix(lneA.adj)
+
+# repeat for lne.B
+lneB.adj <-  matrix(, nrow = 7, ncol = 7) # create an empty 7 x 7  matrix
+lneB.adj[lne.B < 1 & lne.B > 0] = -1 # if less than 1 (but > 0), then -1
+lneB.adj[lne.B >= 1 ] = 1 # if greater than 1, then 1
+lneB.adj[lne.B == 0 ] = 0 # if 0, then 0
+colnames(lneB.adj)<-colnames(lne.B) 
+rownames(lneB.adj)<-colnames(lne.B)
+lneB.adj<-as.matrix(lneB.adj)
+
+
+# All others can be converted to 1/0 more logically
+
+betas_list<-list(hros.A, pcvb, bcc.A, bcc.B)
+adj.list <- list()
+
+for(i in 1: length(betas_list)) {
+  adj.matrix <-  matrix(, nrow = 7, ncol = 7) # create an empty 7 x 7  matrix
+  adj.matrix[betas_list[[i]] < 0 ] = -1 # if less than 0, then -1
+  adj.matrix[betas_list[[i]] > 0 ] = 1 # if greater than 0, then 1
+  adj.matrix[betas_list[[i]] == 0 ] = 0 # if 0, then 0
+  colnames(adj.matrix)<-colnames(betas_list[[i]]) 
+  rownames(adj.matrix)<-colnames(betas_list[[i]])
+  adj.list[[i]]<-adj.matrix
+  
+}
+#adj.list
+
+# add in the adjacency matrices from the odds ratio method an the known interactions to this list
+adj.list[[5]]<-lneA.adj
+adj.list[[6]]<-lneB.adj
+adj.list[[7]]<-competition_stronger_rainier
+adj.list[[8]]<-predation_stronger_rainier
+
+
+mat_list_names<-c("hros.adj", "pcvb.adj", "bccA.adj", "bccB.adj", "lneA.adj", "lneB.adj", "competition.stronger", "predation.stronger")
+
+names(adj.list)<-mat_list_names
+```
+
+## Calculate network statistcs (methods comparison)
+
+Compile networks
+
+```{r}
+# Function to compile all networks, including both known interaction networks, into a list
+rm_degen<- function(mat) {
+  deg_row<-which(rowSums(abs(mat))==0)
+  deg_col<-which(colSums(abs(mat))==0)
+  if (length(deg_row)>0|length(deg_col)>0){
+    mat2<-mat[-which(rowSums(abs(mat))==0),-which(colSums(abs(mat))==0)]
+  } else {
+    mat2<-mat  
+  }
+  return(mat2)
+}
+
+mat_list_nd<-sapply(X = adj.list, FUN = rm_degen)
+
+# create a graph object
+graph_list_nd<-lapply(mat_list_nd, graph.adjacency, mode="directed", weighted=TRUE, diag=FALSE)
+
+# get a metaweb of all interactions
+metaweb(graph_list_nd) 
+```
+
+## Estimate accuracy statistics (for presence/absence of a link)
+
+MUST be broken down by interaction TYPE (negative matrix and positive matrix for each)
+
+```{r}
+lapply(X = adj.list, FUN = function(x) {
+  x[x < 0] <- 0
+  return(x)}) -> adj.list_pos
+
+lapply(X = adj.list, FUN = function(x) {
+  x[x > 0] <- 0
+  return(x)}) -> adj.list_neg
+```
+
+Implement the "True Skills Statistic" (from Allouche et al. 2006, Journal of Animal Ecology) and precision & recall, following Sander et al. (2017, Sci. Rep.)
+
+Define parameters of TSS, in terms of associations and interactions
+a = number of times for which an interaction (presence AND SIGN) was correctly inferred (as an association)
+b = number of times for which there is no interaction, but the model predicts an association
+c = number of times for which there is an interaction, but there is no association
+d = number of times that no interaction is correctly inferred
+
+a = true positive
+b = false positive
+c = false negative
+d = true negative
+
+```{r}
+# function to pull a,b,c,d from two matrices
+fxn_abcd <- function(n_assoc, n_true) {
+  if (n_assoc == 0 & n_true == 0) { 
+    return("d") 
+  } else if (n_assoc == n_true) {
+    return("a")
+  } else if (n_assoc != 0 & n_true == 0) {
+      return("b")
+  } else if (n_assoc == 0 & n_true != 0) {
+      return("c")
+    } else {return("none")}
+}
+
+# function to calculate 4 stats of interest
+fxn_accuracy <- function(x) {
+  # give named vector
+    tibble(
+      precision = x$a / (x$a + x$b),
+      recall = x$a / (x$a + x$c),
+      tss = ((x$a * x$d) - (x$b * x$c)) / ((x$a + x$c)*(x$b + x$d))) %>%
+    return()
+}
+
+# compare a "true" (interaction) network and an association network
+# assumes same interaction set in both
+fxn_compare <- function(x_assoc, x_true) {
+  
+  # make sure both have same signs (because assumes same interaction "type")
+  # e.g., sep. out positive/negative interactions before running function
+  x_assoc <- abs(x_assoc)
+  x_true <- abs(x_true)
+  
+  # convert both matrices into lists of pairs
+  df_assoc <- as_tibble(as.table(x_assoc))
+  df_true <- as_tibble(as.table(x_true))
+  
+  # join
+  df_assoc %>%
+    left_join(df_true, suffix = c("_assoc", "_true"), by = c("Var1", "Var2")) %>%
+    # filter out diagonals
+    filter(Var1 != Var2) %>%
+    #mutate(x_diag = ifelse(Var1 == Var2, "yes", "no")) %>%
+    rowwise() %>%
+    mutate(tally_abcd = fxn_abcd(n_assoc = n_assoc, n_true = n_true)) %>%
+    # tally up how many of each
+    group_by(tally_abcd) %>%
+    summarise(errormat = n()) %>%
+    spread(key = tally_abcd, value = errormat) -> error_tally
+  # if have all columnms...
+  all_abcd <- c("a", "b", "c", "d")
+  if (all(all_abcd %in% colnames(error_tally))) {
+    return(fxn_accuracy(error_tally))
+  } else {
+    # else, add "0" columns
+    missing_col <- all_abcd[! all_abcd %in% colnames(error_tally)]
+    add_to_df <- matrix(nrow = 1, ncol = length(missing_col), 
+                        data = rep(0, length(missing_col)))
+    colnames(add_to_df) <- missing_col
+    return(fxn_accuracy(cbind(error_tally, as_tibble(add_to_df))))
+  }
+}
+```
+
+Run functions.
+
+```{r, message=FALSE}
+# map across the list of empirical networks
+adj.list_pos_emp <- adj.list_pos
+adj.list_neg_emp <- adj.list_neg
+
+adj.list_pos_emp[which(names(adj.list_pos_emp) %in% known_interactions)] <- NULL
+adj.list_neg_emp[which(names(adj.list_neg_emp) %in% known_interactions)] <- NULL
+
+bind_rows(
+  adj.list_pos_emp %>%
+    map(fxn_compare, x_true = adj.list_pos$competition.stronger) %>%
+    bind_rows(.id = "method") %>%
+    mutate(empirical_network = "competition.stronger",
+           signs = "positive"),
+  
+  adj.list_pos_emp %>%
+    map(fxn_compare, x_true = adj.list_pos$predation.stronger) %>%
+    bind_rows(.id = "method") %>%
+    mutate(empirical_network = "predation.stronger",
+           signs = "positive"),
+  
+  adj.list_neg_emp %>%
+    map(fxn_compare, x_true = adj.list_neg$competition.stronger) %>%
+    bind_rows(.id = "method") %>%
+    mutate(empirical_network = "competition.stronger",
+           signs = "negative"),
+  
+  adj.list_neg_emp %>%
+    map(fxn_compare, x_true = adj.list_neg$predation.stronger) %>%
+    bind_rows(.id = "method") %>%
+    mutate(empirical_network = "predation.stronger",
+           signs = "negative")) -> accuracy_stats_df
+```
+
+## Generate comparable random networks
+
+For each association network, generate a set of random networks to compare their accuracy and precision. First write a function to generate Erdos-Renyi networks.
+
+```{r}
+#n_rand <- 5
+net_rand <- function(x, # adjacency matrix
+                     n_rand = 100) {
+  
+  x <- abs(x)
+  diag(x) <- 0
+  # calculate number of edges (links between species)
+  m <- length(which(x != 0))
+  # calculate number of vertices (species)
+  n <- length(which(colSums(x) + rowSums(x) > 0))
+  # generate n_rand random graphs, according to Erdos-Renyi model
+  # (each edge created with same constant probability)
+  y <- replicate(n = n_rand, 
+                 expr = erdos.renyi.game(n = n, p.or.m = m, type = "gnm",
+                                         directed = TRUE, loops = FALSE), 
+                 simplify = FALSE)
+  return(y)
+}
+```
+
+Run for each empirical network, also for negative & positive links alone
+
+```{r, message=FALSE}
+# make a list only of the association networks
+
+# pre-allocate list of random networks
+assoc_list_rand_pos <- vector(mode = "list", length = length(adj.list_pos_emp))
+assoc_list_rand_neg <- vector(mode = "list", length = length(adj.list_neg_emp))
+names(assoc_list_rand_pos) <- names(adj.list_pos_emp)
+names(assoc_list_rand_neg) <- names(adj.list_neg_emp)
+
+# will return a list of lists
+for (i in 1:length(adj.list_pos_emp)) {
+  assoc_list_rand_pos[[i]] <- net_rand(adj.list_pos_emp[[i]], n_rand = 100)
+}
+for (i in 1:length(adj.list_neg_emp)) {
+  assoc_list_rand_neg[[i]] <- net_rand(adj.list_neg_emp[[i]], n_rand = 100)
+}
+
+# function to make adjacency matrices of the right size
+mat_size <- function(x){
+  if (all(dim(x) != c(7, 7))) {
+    ncol_add <- 7-ncol(x)
+    nrow_add <- 7-nrow(x)
+    new_cols <- matrix(data = 0, nrow = nrow(x), ncol = ncol_add)
+    x <- cbind(x, new_cols)
+    new_rows <- matrix(data = 0, nrow = nrow_add, ncol = ncol(x))
+    x <- rbind(x, new_rows)
+    return(x)
+  } else { return(x) }
+}
+
+# function to add names to simulated networks
+sp_names <- colnames(adj.list$predation.stronger)
+mat_names <- function(x, sp_names) {
+  # randomly shuffle names
+  sp_names_r <- sample(x = sp_names, size = length(sp_names), replace = FALSE)
+  colnames(x) <- sp_names_r
+  rownames(x) <- sp_names_r
+  return(x)
+}
+
+rand_pos_tmp <- vector(mode = "list", length = length(assoc_list_rand_pos))
+names(rand_pos_tmp) <- names(assoc_list_rand_pos)
+
+for (i in 1:length(assoc_list_rand_pos)) {
+  tmp <- assoc_list_rand_pos[[i]]
+  bind_rows(
+    tmp %>%
+      map(as_adjacency_matrix, sparse = FALSE) %>%
+      # then check the dimensions - if not the same as empirical interaction network,
+      # need to add empty rows & columns
+      map(mat_size) %>%
+      # add names
+      map(mat_names, sp_names = sp_names) %>%
+      map(fxn_compare, x_true = adj.list_pos$competition.stronger) %>%
+      bind_rows() %>%
+      mutate(empirical_network = "competition.stronger",
+             signs = "positive"),
+    tmp %>%
+      map(as_adjacency_matrix, sparse = FALSE) %>%
+      map(mat_size) %>%
+      map(mat_names, sp_names = sp_names) %>%
+      map(fxn_compare, x_true = adj.list_pos$predation.stronger) %>%
+      bind_rows() %>%
+      mutate(empirical_network = "predation.stronger",
+             signs = "positive")) -> rand_pos_tmp[[i]]
+}
+
+rand_neg_tmp <- vector(mode = "list", length = length(assoc_list_rand_neg))
+names(rand_neg_tmp) <- names(assoc_list_rand_neg)
+
+for (i in 1:length(assoc_list_rand_neg)) {
+  tmp <- assoc_list_rand_neg[[i]]
+  bind_rows(
+    tmp %>%
+      map(as_adjacency_matrix, sparse = FALSE) %>%
+      # then check the dimensions - if not the same as empirical interaction network,
+      # need to add empty rows & columns
+      map(mat_size) %>%
+      # add names
+      map(mat_names, sp_names = sp_names) %>%
+      map(fxn_compare, x_true = abs(adj.list_neg$competition.stronger)) %>%
+      bind_rows() %>%
+      mutate(empirical_network = "competition.stronger",
+             signs = "negative"),
+    tmp %>%
+      map(as_adjacency_matrix, sparse = FALSE) %>%
+      map(mat_size) %>%
+      map(mat_names, sp_names = sp_names) %>%
+      map(fxn_compare, x_true = abs(adj.list_neg$predation.stronger)) %>%
+      bind_rows() %>%
+      mutate(empirical_network = "predation.stronger",
+             signs = "negative")) -> rand_neg_tmp[[i]]
+}
+
+# bind together
+bind_rows(
+  bind_rows(rand_pos_tmp, .id = "method"),
+  bind_rows(rand_neg_tmp, .id = "method")) -> accuracy_stats_rand_df
+```
+
+Calculate statistics. Note that the statistics for most of these are not normally distributed, sometimes heavily skewed and zero-inflated. Thus to get 95% confidence intervals, we will bootstrap.
+
+Next, write functions to bootstrap 95% confidence intervals for each simulation set.
+
+```{r}
+get_boot_ci <- function(x) {
+  b1 <- one.boot(data = x, mean, 1000)
+  b2 <- boot.ci(b1, type = "bca")$bca[4:5]
+  return(tibble(ci_lower = b2[1],
+                ci_upper = b2[2]))
+}
+
+# want to split based on multiple factors, so need to combine into one factor name
+accuracy_stats_rand_df %>%
+  mutate(method_empiricalnetwork_signs = paste(method, empirical_network, signs, sep = "_")) %>%
+  dplyr::select(-method, -empirical_network, -signs) -> accuracy_stats_rand_split
+
+split(accuracy_stats_rand_split, 
+      f = accuracy_stats_rand_split$method_empiricalnetwork_signs) -> boot_list
+
+# get 95% bootstrapped CIs
+boot_list_precision <- map(boot_list, .f = function(x) get_boot_ci(x$precision)) 
+boot_list_recall <- map(boot_list, .f = function(x) get_boot_ci(x$recall)) 
+boot_list_tss <- map(boot_list, .f = function(x) get_boot_ci(x$tss)) 
+
+# compile stats
+bind_rows(
+  boot_list_precision %>%
+    bind_rows(.id = "method_empiricalnetwork_signs") %>%
+    mutate(accuracy_stat = "precision"),
+  boot_list_recall %>%
+    bind_rows(.id = "method_empiricalnetwork_signs") %>%
+    mutate(accuracy_stat = "recall"),
+  boot_list_tss %>%
+    bind_rows(.id = "method_empiricalnetwork_signs") %>%
+    mutate(accuracy_stat = "tss")) %>%
+  separate(method_empiricalnetwork_signs,
+           into = c("method", "empirical_network", "signs"), sep = "_") -> boot_df
+
+# join with empirical stats
+gather(accuracy_stats_df, precision:tss, key = "accuracy_stat", value = "empirical_value") %>%
+  left_join(boot_df) %>%
+  # any outside range?
+  mutate(empirical_higher_than = ifelse(empirical_value > ci_upper,
+                                        "yes", "no"),
+         empirical_lower_than = ifelse(empirical_value < ci_lower,
+                                       "yes", "no")) -> accuracy_overall_df
+```
+
+## Calculate sign-accuracy statistics
+
+For links where an interaction was correctly inferred, how accurate are co-occurrence methods in inferring the correct sign?
+
+```{r}
+fxn_abcd_signed <- function(n_assoc, n_true) {
+  if (n_assoc < 0 & n_true < 0) { 
+    return("d") 
+  } else if (n_assoc > 0 & n_true > 0) {
+    return("a")
+  } else if (n_assoc > 0 & n_true < 0) {
+      return("b")
+  } else if (n_assoc < 0 & n_true > 0) {
+      return("c")
+    } else {return("none")}
+}
+
+# compare a "true" (interaction) network and an association network
+# assumes same interaction set in both
+fxn_compare_signed <- function(x_assoc, x_true) {
+  
+  # convert both matrices into lists of pairs
+  df_assoc <- as_tibble(as.table(x_assoc))
+  df_true <- as_tibble(as.table(x_true))
+  
+  # join
+  df_assoc %>%
+    left_join(df_true, suffix = c("_assoc", "_true"), by = c("Var1", "Var2")) %>%
+    # filter out diagonals
+    filter(Var1 != Var2) %>%
+    # filter out anything where there is a 0
+    filter(n_assoc != 0) %>%
+    filter(n_true != 0) -> tmp
+  
+  if (nrow(tmp) == 0) {
+    
+    return(tibble(precision = 0, recall = 0, tss = 0))
+  
+    } else {
+    
+    tmp %>%
+      rowwise() %>%
+      mutate(tally_abcd = fxn_abcd_signed(n_assoc = n_assoc, n_true = n_true)) %>%
+      # tally up how many of each
+      group_by(tally_abcd) %>%
+      summarise(errormat = n()) %>%
+      spread(key = tally_abcd, value = errormat) -> error_tally
+    
+      # if have all columnms...
+    all_abcd <- c("a", "b", "c", "d")
+    
+    if (all(all_abcd %in% colnames(error_tally))) {
+    
+        return(fxn_accuracy(error_tally))
+    
+      } else {
+      # else, add "0" columns
+      missing_col <- all_abcd[! all_abcd %in% colnames(error_tally)]
+      add_to_df <- matrix(nrow = 1, ncol = length(missing_col), 
+                          data = rep(0, length(missing_col)))
+      colnames(add_to_df) <- missing_col
+      return(fxn_accuracy(cbind(error_tally, as_tibble(add_to_df))))
+    }
+  }
+}
+```
+
+Run for co-occurrence results
+
+```{r}
+# map across the list of empirical networks
+adj.list_emp <- adj.list
+adj.list_emp[which(names(adj.list_emp) %in% known_interactions)] <- NULL
+
+bind_rows(
+  adj.list_emp %>%
+    map(fxn_compare_signed, x_true = adj.list$competition.stronger) %>%
+    bind_rows(.id = "method") %>%
+    mutate(empirical_network = "competition.stronger"),
+  
+  adj.list_emp %>%
+    map(fxn_compare, x_true = adj.list$predation.stronger) %>%
+    bind_rows(.id = "method") %>%
+    mutate(empirical_network = "predation.stronger")) -> accuracy_stats_df_signed
+```
+
+Run for random networks, with 95% CIs
+
+```{r}
+# need a new function to randomly assign signs based on the weight of signs estimated in the co-occurrence method
+# x is the empirical matrix (from co-occurrence output)
+# y is the randomly generated matrix of 0,1
+rand_sign <- function(x, y) {
+  pos <- length(which(x > 0))
+  neg <- length(which(x < 0))
+  tot <- length(which(x != 0))
+
+  y_sign <- sample(x = c(-1, 1), size = length(y), replace = TRUE, prob = c(neg/tot, pos/tot))
+  y_sign_mat <- matrix(y_sign, nrow = nrow(y))
+  return(y * y_sign_mat)
+}
+
+# pre-allocate list of random networks
+assoc_list_rand <- vector(mode = "list", length = length(adj.list_emp))
+names(assoc_list_rand) <- names(adj.list_emp)
+
+# will return a list of lists
+for (i in 1:length(adj.list_emp)) {
+  assoc_list_rand[[i]] <- net_rand(abs(adj.list_emp[[i]]), n_rand = 100)
+}
+
+rand_tmp <- vector(mode = "list", length = length(assoc_list_rand))
+names(rand_tmp) <- names(assoc_list_rand)
+
+for (i in 1:length(assoc_list_rand)) {
+  tmp <- assoc_list_rand[[i]]
+  tmp_emp <- adj.list_emp[[i]]
+  bind_rows(
+    tmp %>%
+      map(as_adjacency_matrix, sparse = FALSE) %>%
+      # then check the dimensions - if not the same as empirical interaction network,
+      # need to add empty rows & columns
+      map(mat_size) %>%
+      # add names
+      map(mat_names, sp_names = sp_names) %>%
+      # add signs
+      map(function(y) rand_sign(x = tmp_emp, y = y)) %>%
+      map(fxn_compare, x_true = adj.list$competition.stronger) %>%
+      bind_rows() %>%
+      mutate(empirical_network = "competition.stronger"),
+    tmp %>%
+      map(as_adjacency_matrix, sparse = FALSE) %>%
+      map(mat_size) %>%
+      map(mat_names, sp_names = sp_names) %>%
+      map(function(y) rand_sign(x = tmp_emp, y = y)) %>%
+      map(fxn_compare, x_true = adj.list$predation.stronger) %>%
+      bind_rows() %>%
+      mutate(empirical_network = "predation.stronger")) -> rand_tmp[[i]]
+}
+
+# bind together
+bind_rows(rand_tmp, .id = "method") -> accuracy_stats_rand_df_signed
+
+# want to split based on multiple factors, so need to combine into one factor name
+accuracy_stats_rand_df_signed %>%
+  mutate(method_empiricalnetwork = paste(method, empirical_network, sep = "_")) %>%
+  dplyr::select(-method, -empirical_network) -> accuracy_stats_rand_split_signed
+
+split(accuracy_stats_rand_split_signed, 
+      f = accuracy_stats_rand_split_signed$method_empiricalnetwork) -> boot_list_signed
+
+# get 95% bootstrapped CIs
+get_boot_ci_error <- function(x) {
+  if (length(unique(x)) == 1) {
+    return(tibble(ci_lower = unique(x),
+                  ci_upper = unique(x)))
+  } else {
+    b1 <- one.boot(data = x, mean, 1000)
+    b2 <- boot.ci(b1, type = "bca")$bca[4:5]
+    return(tibble(ci_lower = b2[1],
+                ci_upper = b2[2]))
+  }
+}
+
+boot_list_precision_signed <- map(boot_list_signed, .f = function(x) get_boot_ci_error(x$precision)) 
+boot_list_recall_signed <- map(boot_list_signed, .f = function(x) get_boot_ci_error(x$recall)) 
+boot_list_tss_signed <- map(boot_list_signed, .f = function(x) get_boot_ci_error(x$tss)) 
+
+# compile stats
+bind_rows(
+  boot_list_precision_signed %>%
+    bind_rows(.id = "method_empiricalnetwork") %>%
+    mutate(accuracy_stat = "precision"),
+  boot_list_recall_signed %>%
+    bind_rows(.id = "method_empiricalnetwork") %>%
+    mutate(accuracy_stat = "recall"),
+  boot_list_tss_signed %>%
+    bind_rows(.id = "method_empiricalnetwork") %>%
+    mutate(accuracy_stat = "tss")) %>%
+  separate(method_empiricalnetwork,
+           into = c("method", "empirical_network"), sep = "_") -> boot_df_signed
+
+# join with empirical stats
+gather(accuracy_stats_df_signed, precision:tss, key = "accuracy_stat", value = "empirical_value") %>%
+  left_join(boot_df_signed) %>%
+  # any outside range?
+  mutate(empirical_higher_than = ifelse(empirical_value > ci_upper,
+                                        "yes", "no"),
+         empirical_lower_than = ifelse(empirical_value < ci_lower,
+                                       "yes", "no")) -> accuracy_overall_df_signed
+```
+
+## Plot just TSS, for all methods, for signed/unsigned comparison
+
+```{r}
+manual_color <- c("red", "blue", "black")
+png("overall_tss_performance.png", width = 8, height = 8, units = "in", res=300)
+accuracy_overall_df_signed %>%
+  bind_rows(accuracy_overall_df) %>%
+  mutate(signs = ifelse(is.na(signs), "interaction sign", signs)) %>%
+  mutate(outside_ci = ifelse(empirical_lower_than == "yes",
+                             "lower", ifelse(empirical_higher_than == "yes", "higher", "no"))) %>%
+  # rename levels so better plotting
+  mutate(empirical_network = fct_recode(empirical_network,
+                                        "Competition stronger" = "competition.stronger",
+                                        "Predation stronger" = "predation.stronger"),
+         method = fct_recode(method,
+                             "Markov network" = "hros.adj",
+                             "Partial correlation,\nenv. corrected" = "pcvb.adj",
+                             "JSDM residuals" = "bccA.adj",
+                             "JSDM residuals,\nenv. corrected" = "bccB.adj",
+                             "Odds ratio" = "lneA.adj",
+                             "Odds ratio,\nenv. corrected" = "lneB.adj"),
+         signs = fct_recode(signs,
+                           "Interaction sign" = "interaction sign",
+                           "Positive interactions only" = "positive",
+                           "Negative interactions only" = "negative")) %>%
+  mutate(signs = factor(signs, levels = c("Positive interactions only",
+                                          "Negative interactions only", 
+                                          "Interaction sign"))) %>%
+  filter(accuracy_stat == "tss") %>%
+  ggplot(aes(x = method, y = empirical_value)) +
+  geom_point(aes(color = outside_ci)) +
+  scale_color_manual(values = manual_color) +
+  geom_errorbar(aes(ymin = ci_lower, ymax = ci_upper), color = "black", width = 0.1) +
+  facet_grid(signs ~ empirical_network, scales = "free") +
+  labs(x = "Co-occurrence method", y = "Value of accuracy statistic", color = "Outside of 95% \nconfidence interval?") +
+  theme(axis.text.x = element_text(angle = 90, hjust = 1),
+        panel.grid.minor = element_blank())
+dev.off()
+```
+
+## Plot comparison to random unsigned (for supplement) - not with raw simulated data but with the 95% CIs
+
+```{r}
+manual_color <- c("red", "blue", "black")
+
+png(filename = "accuracy_random_positive.png", width = 7, height = 7, units = "in", res = 300)
+accuracy_overall_df %>%
+  filter(signs == "positive") %>%
+  mutate(outside_ci = ifelse(empirical_lower_than == "yes",
+                             "lower", ifelse(empirical_higher_than == "yes", "higher", "no"))) %>%
+  # rename levels so better plotting
+  mutate(empirical_network = fct_recode(empirical_network,
+                                        "Competition stronger" = "competition.stronger",
+                                        "Predation stronger" = "predation.stronger"),
+         method = fct_recode(method,
+                             "Markov network" = "hros.adj",
+                             "Partial correlation,\nenv. corrected" = "pcvb.adj",
+                             "JSDM residuals" = "bccA.adj",
+                             "JSDM residuals,\nenv. corrected" = "bccB.adj",
+                             "Odds ratio" = "lneA.adj",
+                             "Odds ratio,\nenv. corrected" = "lneB.adj")) %>%
+  ggplot(aes(x = method, y = empirical_value)) +
+  geom_point(aes(color = outside_ci)) +
+  scale_color_manual(values = manual_color) +
+  geom_errorbar(aes(ymin = ci_lower, ymax = ci_upper), color = "black", width = 0.1) +
+  facet_grid(accuracy_stat ~ empirical_network, scales = "free") +
+  labs(x = "Co-occurrence method", y = "Value of accuracy statistic", color = "Outside of 95% \nconfidence interval?") +
+  theme(axis.text.x = element_text(angle = 90, hjust = 1),
+        panel.grid.minor = element_blank())
+dev.off()
+```
+
+```{r}
+png(filename = "accuracy_random_negative.png", width = 7, height = 7, units = "in", res = 300)
+accuracy_overall_df %>%
+  filter(signs == "negative") %>%
+  mutate(outside_ci = ifelse(empirical_lower_than == "yes",
+                             "lower", ifelse(empirical_higher_than == "yes", "higher", "no"))) %>%
+  # rename levels so better plotting
+  mutate(empirical_network = fct_recode(empirical_network,
+                                        "Competition stronger" = "competition.stronger",
+                                        "Predation stronger" = "predation.stronger"),
+         method = fct_recode(method,
+                             "Markov network" = "hros.adj",
+                             "Partial correlation,\nenv. corrected" = "pcvb.adj",
+                             "JSDM residuals" = "bccA.adj",
+                             "JSDM residuals,\nenv. corrected" = "bccB.adj",
+                             "Odds ratio" = "lneA.adj",
+                             "Odds ratio,\nenv. corrected" = "lneB.adj")) %>%
+  ggplot(aes(x = method, y = empirical_value)) +
+  geom_point(aes(color = outside_ci)) +
+  scale_color_manual(values = manual_color) +
+  geom_errorbar(aes(ymin = ci_lower, ymax = ci_upper), color = "black", width = 0.1) +
+  facet_grid(accuracy_stat ~ empirical_network, scales = "free") +
+  labs(x = "Co-occurrence method", y = "Value of accuracy statistic", color = "Outside of 95% \nconfidence interval?") +
+  theme(axis.text.x = element_text(angle = 90, hjust = 1),
+        panel.grid.minor = element_blank())
+dev.off()
+```
+
+## Plot methods comparision 
+
+```{r, eval=FALSE}
+# models used:
+# competition_stronger_rainier # non-trophically dominated network (known)
+# predation_stronger_rainier # trophically dominated network (known)
+# lne.A # odds ratio
+# lne.B # odds ratio with environmental conditioning
+# hros.A # markov partial correlations
+# pcvb # inverse covariance
+# bcc.A # JSDM residuals
+# bcc.B # JSDM residuals with environmental conditioning
+
+# first, make sure that all of your matrices have species in the same order
+# plot 
+plot.new()
+# panel format for all 8 plots 
+par(mfrow=c(2,4))
+par(mar=c(5,5,6,5), oma=c(1,1,1,1))
+
+# panel format for two known networks and markov network 
+par(mfrow=c(1,3))
+par(mar=c(5,5,5,5), oma=c(1,1,1,1))
+
+radian.rescale <- function(x, start=0, direction=1) {
+  c.rotate <- function(x) (x + start) %% (2 * pi) * direction
+  c.rotate(scales::rescale(x, c(0, 2 * pi), range(x)))
+}
+
+# Plot of known, trophically-dominated network
+g.trophic<-graph.adjacency(predation_stronger_rainier, mode="directed",weighted=TRUE,diag=FALSE)
+l<-layout.circle(g.trophic)
+l<- layout.norm(l, ymin=-1, ymax=1, xmin=-1, xmax=1) 
+deg<-5 
+V(g.trophic)$size<-deg 
+E(g.trophic)$width<-2
+E(g.trophic)[E(g.trophic)$weight==-1]$color<-"red"  # red for negative interactions
+E(g.trophic)[E(g.trophic)$weight==1]$color<-"blue" # blue for positive interactions
+V(g.trophic)$color <- "gray80"
+V(g.trophic)$label.cex <-1.5
+lab.locs <- radian.rescale(x=1:7, direction=-1, start=0) # 7 = number of nodes
+plot(g.trophic, rescale=FALSE, 
+     layout=l*1.05,
+     #vertex.size=2, 
+     vertex.label.dist=4, 
+     vertex.label.degree=lab.locs, 
+     vertex.color="gray80",
+     vertex.label.color="black",
+     vertex.label.family="sans",
+     edge.curved=.05,
+     edge.arrow.size=0.5) # this line controls how big the arrow is
+mtext(text = "Consumer-dominated\ntrophic network",side = 3,line = 3, cex=1.5, font=3)
+#mtext(text = "Consumer-dominated\ntrophic network",side = 3,line = 2, cex=1.5) #for 3-panel plot
+
+# Plot of known, nontrophically (competitor)-dominated network
+g.trophic<-graph.adjacency(competition_stronger_rainier, mode="directed",weighted=TRUE,diag=FALSE)
+l<-layout.circle(g.trophic)
+l<- layout.norm(l, ymin=-1, ymax=1, xmin=-1, xmax=1) 
+deg<-5 
+V(g.trophic)$size<-deg 
+E(g.trophic)$width<-2
+E(g.trophic)[E(g.trophic)$weight==-1]$color<-"red"  # red for negative interactions
+E(g.trophic)[E(g.trophic)$weight==1]$color<-"blue" # blue for positive interactions
+V(g.trophic)$color <- "gray80"
+V(g.trophic)$label.cex <-1.5
+lab.locs <- radian.rescale(x=1:7, direction=-1, start=0) # 7 = number of nodes
+plot(g.trophic, rescale=FALSE, 
+     layout=l*1.05,
+     #vertex.size=2, 
+     vertex.label.dist=4, 
+     vertex.label.degree=lab.locs, 
+     vertex.color="gray80",
+     vertex.label.color="black",
+     vertex.label.family="sans",
+     edge.curved=.05,
+     edge.arrow.size=0.5) # this line controls how big the arrow is
+mtext(text = "Competitor-dominated\ntrophic network",side = 3,line = 3, cex=1.5, font=3)
+#mtext(text = "Competitor-dominated\ntrophic network",side = 3,line = 2, cex=1.5) #for 3-panel plot
+
+# plot lne.A
+g.lneA<-graph.adjacency(lne.A, mode="directed",weighted=TRUE,diag=FALSE)
+l<-layout.circle(g.lneA)
+l<- layout.norm(l, ymin=-1, ymax=1, xmin=-1, xmax=1) 
+deg<-5 
+V(g.lneA)$size<-deg 
+E(g.lneA)$width<-(abs(E(g.lneA)$weight)/max(abs(E(g.lneA)$weight)))*10
+E(g.lneA)[E(g.lneA)$weight<1]$color<-"red"  # red for negative interactions
+E(g.lneA)[E(g.lneA)$weight>1]$color<-"blue" # blue for positive interactions
+V(g.lneA)$color <- "gray80"
+V(g.lneA)$label.cex <-1.5
+lab.locs <- radian.rescale(x=1:7, direction=-1, start=0) # 7 = number of nodes
+plot(g.lneA, rescale=FALSE, 
+     layout=l*1.05,
+     #vertex.size=2, 
+     vertex.label.dist=4, 
+     vertex.label.degree=lab.locs, 
+     vertex.color="gray80",
+     vertex.label.color="black",
+     vertex.label.family="sans",
+     edge.arrow.size=0.5) # this line controls how big the arrow is
+mtext(text = "Odds Ratio",side = 3,line = 4, cex=1.5)
+
+# plot lne.B
+g.lneB<-graph.adjacency(lne.B, mode="directed",weighted=TRUE,diag=FALSE)
+l<-layout.circle(g.lneB)
+l<- layout.norm(l, ymin=-1, ymax=1, xmin=-1, xmax=1) 
+deg<-5 
+V(g.lneB)$size<-deg 
+E(g.lneB)$width<-(abs(E(g.lneB)$weight)/max(abs(E(g.lneB)$weight)))*10
+E(g.lneB)[E(g.lneB)$weight<1]$color<-"red"  # red for negative interactions
+E(g.lneB)[E(g.lneB)$weight>1]$color<-"blue" # blue for positive interactions
+V(g.lneB)$color <- "gray80"
+V(g.lneB)$label.cex <-1.5
+lab.locs <- radian.rescale(x=1:7, direction=-1, start=0) # 7 = number of nodes
+plot(g.lneB, rescale=FALSE, 
+     layout=l*1.05,
+     #vertex.size=2, 
+     vertex.label.dist=4, 
+     vertex.label.degree=lab.locs, 
+     vertex.color="gray80",
+     vertex.label.color="black",
+     vertex.label.family="sans",
+     edge.arrow.size=0.5) # this line controls how big the arrow is
+mtext(text = "Odds Ratio\n(environment)",side = 3,line = 3, cex=1.5)
+
+# plot hros.A
+g.hrosA<-graph.adjacency(hros.A, mode="directed",weighted=TRUE,diag=FALSE)
+l<-layout.circle(g.hrosA) 
+l<- layout.norm(l, ymin=-1, ymax=1, xmin=-1, xmax=1) 
+deg<-5 
+V(g.hrosA)$size<-deg 
+E(g.hrosA)$width<-(abs(E(g.hrosA)$weight)/max(abs(E(g.hrosA)$weight)))*8
+E(g.hrosA)[E(g.hrosA)$weight<0]$color<-"red"  # red for negative interactions
+E(g.hrosA)[E(g.hrosA)$weight>0]$color<-"blue" # blue for positive interactions
+V(g.hrosA)$color <- "gray80"
+V(g.hrosA)$label.cex <-1.5
+lab.locs <- radian.rescale(x=1:7, direction=-1, start=0) # 7 = number of nodes
+plot(g.hrosA, rescale=FALSE, 
+     layout=l*1.05,
+     #vertex.size=2, 
+     vertex.label.dist=4, 
+     vertex.label.degree=lab.locs, 
+     vertex.color="gray80",
+     vertex.label.color="black",
+     vertex.label.family="sans",
+     edge.curved=.05,
+     edge.arrow.size=0.5) # this line controls how big the arrow is
+mtext(text = "Markov network",side = 3,line = 4, cex=1.5)
+#mtext(text = "Markov network",side = 3,line = 2, cex=1.5) #for 3-panel plot
+
+# plot pcvb
+g.pcvb<-graph.adjacency(pcvb, mode="directed",weighted=TRUE,diag=FALSE)
+l<-layout.circle(g.pcvb) 
+l<- layout.norm(l, ymin=-1, ymax=1, xmin=-1, xmax=1) 
+deg<-5 
+V(g.pcvb)$size<-deg 
+E(g.pcvb)$width<-(abs(E(g.pcvb)$weight)/max(abs(E(g.pcvb)$weight)))*8
+#E(g.pcvb)$width<-(abs(E(g.pcvb)$weight))*25
+E(g.pcvb)[E(g.pcvb)$weight<0]$color<-"red"  # red for negative interactions
+E(g.pcvb)[E(g.pcvb)$weight>0]$color<-"blue" # blue for positive interactions
+V(g.pcvb)$color <- "gray80"
+V(g.pcvb)$label.cex <-1.5
+lab.locs <- radian.rescale(x=1:7, direction=-1, start=0) # 7 = number of nodes
+plot(g.pcvb, rescale=FALSE, 
+     layout=l*1.05,
+     #vertex.size=2, 
+     vertex.label.dist=4, 
+     vertex.label.degree=lab.locs, 
+     vertex.color="gray80",
+     vertex.label.color="black",
+     vertex.label.family="sans",
+     edge.curved=.05,
+     edge.arrow.size=0.5) # this line controls how big the arrow is
+mtext(text = "Partial correlations",side = 3,line = 4, cex=1.5)
+
+# plot bcc.A
+g.bccA<-graph.adjacency(bcc.A, mode="directed",weighted=TRUE,diag=FALSE)
+l<-layout.circle(g.bccA) 
+l<- layout.norm(l, ymin=-1, ymax=1, xmin=-1, xmax=1) 
+deg<-5 
+V(g.bccA)$size<-deg 
+E(g.bccA)$width<-(abs(E(g.bccA)$weight)/max(abs(E(g.bccA)$weight)))*4
+E(g.bccA)[E(g.bccA)$weight<0]$color<-"red"  # red for negative interactions
+E(g.bccA)[E(g.bccA)$weight>0]$color<-"blue" # blue for positive interactions
+V(g.bccA)$color <- "gray80"
+V(g.bccA)$label.cex <-1.5
+lab.locs <- radian.rescale(x=1:7, direction=-1, start=0) # 7 = number of nodes
+plot(g.bccA, rescale=FALSE, 
+     layout=l*1.05,
+     #vertex.size=2, 
+     vertex.label.dist=4, 
+     vertex.label.degree=lab.locs, 
+     vertex.color="gray80",
+     vertex.label.color="black",
+     vertex.label.family="sans",
+     edge.curved=.05,
+     edge.arrow.size=0.5) # this line controls how big the arrow is
+mtext(text = "JSDM residuals",side = 3,line = 4, cex=1.5)
+
+# plot bcc.B
+g.bccB<-graph.adjacency(bcc.B, mode="directed",weighted=TRUE,diag=FALSE)
+l<-layout.circle(g.bccB) 
+l<- layout.norm(l, ymin=-1, ymax=1, xmin=-1, xmax=1) 
+deg<-5 
+V(g.bccB)$size<-deg 
+E(g.bccB)$width<-(abs(E(g.bccB)$weight)/max(abs(E(g.bccB)$weight)))*4
+E(g.bccB)[E(g.bccB)$weight<0]$color<-"red"  # red for negative interactions
+E(g.bccB)[E(g.bccB)$weight>0]$color<-"blue" # blue for positive interactions
+V(g.bccB)$color <- "gray80"
+V(g.bccB)$label.cex <-1.5
+lab.locs <- radian.rescale(x=1:7, direction=-1, start=0) # 7 = number of nodes
+plot(g.bccB, rescale=FALSE, 
+     layout=l*1.05,
+     #vertex.size=2, 
+     vertex.label.dist=4, 
+     vertex.label.degree=lab.locs, 
+     vertex.color="gray80",
+     vertex.label.color="black",
+     vertex.label.family="sans",
+     edge.curved=.05,
+     edge.arrow.size=0.5) # this line controls how big the arrow is
+mtext(text = "JSDM residuals\n(environment)",side = 3,line = 3, cex=1.5)
+
+```
+
+
+# TEST OF GUILD-DEPENDENCY
+
+#### Run test of guild-dependency (pseudo-assembly simulation)
+
+``` {r Guild test, include=TRUE, eval=FALSE}
+# Markov network (Harris 2016) method 
+
+# community matrix
+# Load the amphibian community matrix (make sure to set WD)
+MORA.Len.df <- read.csv("Amphibian_community_matrix.csv", header=T)
+X <- MORA.Len.df[ , -1 ] # remove Sample (factor) column
+X <- as.matrix(sapply(X, as.numeric))  # convert to matrix
+
+View(X)
+
+# known amphibian intxn networks
+competition_stronger_rainier
+predation_stronger_rainier
+
+## Predators include: AMGR, AMMA, TAGR
+
+# Start by removing samples that contain any assortment of the 3 predators from the community matrix, leaving it as a guild of just anurans (prey)
+MORA.anurans <- filter(MORA.Len.df, AMGR == 0) # remove samples with AMGR present
+MORA.anurans <- filter(MORA.anurans, AMMA == 0) # from that filtered data, remove samples with AMMA present
+MORA.anurans <- filter(MORA.anurans, TAGR == 0) # from that filtered data, remove samples with TAGR present
+
+# Convert to a matrix
+X.anurans <- MORA.anurans[ , -c(1:3,8) ] # remove Sample (factor) column and unused predator columns
+X.anurans <- as.matrix(sapply(X.anurans, as.numeric))  # convert to matrix
+
+hros.anurans <- rosalia(X.anurans) # run rosalia function (with no prior)
+hros.anurans.betas<-hros.anurans$beta # returns 'interaction strengths'
+colnames(hros.anurans.betas)<-colnames(X.anurans)
+rownames(hros.anurans.betas)<-colnames(X.anurans)
+hros.anurans.betas
+
+# for the purposes of plotting, add back in columns for AMGR (1), AMMA (2), and TAGR (7) and fill in with 0's
+hros.anurans.plotting<-cbind(AMGR = 0, hros.anurans.betas)
+hros.anurans.plotting<-rbind(AMGR = 0, hros.anurans.plotting)
+hros.anurans.plotting<-cbind(AMMA = 0, hros.anurans.plotting)
+hros.anurans.plotting<-rbind(AMMA = 0, hros.anurans.plotting)
+hros.anurans.plotting<-cbind(TAGR = 0, hros.anurans.plotting)
+hros.anurans.plotting<-rbind(TAGR = 0, hros.anurans.plotting)
+#re-order to match plot format in previous analyses
+hros.anurans.plotting<-hros.anurans.plotting[c(3,2,4,5,6,7,1), c(3,2,4,5,6,7,1)]
+
+# Re-introduce samples with just AMGR
+MORA.amgr <- filter(MORA.Len.df, AMMA == 0) # remove samples with AMMA present
+MORA.amgr <- filter(MORA.amgr, TAGR == 0) # from that filtered data, remove samples with TAGR present
+X.amgr <- MORA.amgr[ , -c(1,3,8) ] # remove Sample (factor) column and unused predator columns
+X.amgr <- as.matrix(sapply(X.amgr, as.numeric))  # convert to matrix
+
+hros.amgr <- rosalia(X.amgr) # run rosalia function (with no prior)
+hros.amgr.betas<-hros.amgr$beta # returns 'interaction strengths'
+colnames(hros.amgr.betas)<-colnames(X.amgr)
+rownames(hros.amgr.betas)<-colnames(X.amgr)
+hros.amgr.betas
+
+# Re-introduce samples with just AMMA
+MORA.amma <- filter(MORA.Len.df, AMGR == 0) # remove samples with AMGR present
+MORA.amma <- filter(MORA.amma, TAGR == 0) # from that filtered data, remove samples with TAGR present
+X.amma <- MORA.amma[ , -c(1,2,8) ] # remove Sample (factor) column and unused predator columns
+X.amma <- as.matrix(sapply(X.amma, as.numeric))  # convert to matrix
+
+hros.amma <- rosalia(X.amma) # run rosalia function (with no prior)
+hros.amma.betas<-hros.amma$beta # returns 'interaction strengths'
+colnames(hros.amma.betas)<-colnames(X.amma)
+rownames(hros.amma.betas)<-colnames(X.amma)
+hros.amma.betas
+
+# Re-introduce samples with just TAGR
+MORA.tagr <- filter(MORA.Len.df, AMGR == 0) # remove samples with AMGR present
+MORA.tagr <- filter(MORA.tagr, AMMA == 0) # from that filtered data, remove samples with AMMA present
+X.tagr <- MORA.tagr[ , -c(1:3) ] # remove Sample (factor) column and unused predator columns
+X.tagr <- as.matrix(sapply(X.tagr, as.numeric))  # convert to matrix
+
+hros.tagr <- rosalia(X.tagr) # run rosalia function (with no prior)
+hros.tagr.betas<-hros.tagr$beta # returns 'interaction strengths'
+colnames(hros.tagr.betas)<-colnames(X.tagr)
+rownames(hros.tagr.betas)<-colnames(X.tagr)
+hros.tagr.betas
+
+# Re-introduce samples with AMGR & AMMA
+MORA.ammaamgr <- filter(MORA.Len.df, TAGR == 0) # remove samples with TAGR present
+X.ammaamgr <- MORA.ammaamgr[ , -c(1,8) ] # remove Sample (factor) column and unused predator columns
+X.ammaamgr <- as.matrix(sapply(X.ammaamgr, as.numeric))  # convert to matrix
+
+hros.ammaamgr <- rosalia(X.ammaamgr)# run rosalia function (with no prior)
+hros.ammaamgr.betas<-hros.ammaamgr$beta # returns 'interaction strengths'
+colnames(hros.ammaamgr.betas)<-colnames(X.ammaamgr)
+rownames(hros.ammaamgr.betas)<-colnames(X.ammaamgr)
+hros.ammaamgr.betas
+
+# Re-introduce samples with AMGR & TAGR
+MORA.amgrtagr <- filter(MORA.Len.df, AMMA == 0) # remove samples with AMMA present
+X.amgrtagr <- MORA.amgrtagr[ , -c(1,3) ] # remove Sample (factor) column and unused predator columns
+X.amgrtagr <- as.matrix(sapply(X.amgrtagr, as.numeric))  # convert to matrix
+
+hros.amgrtagr <- rosalia(X.amgrtagr)# run rosalia function (with no prior)
+hros.amgrtagr.betas<-hros.amgrtagr$beta # returns 'interaction strengths'
+colnames(hros.amgrtagr.betas)<-colnames(X.amgrtagr)
+rownames(hros.amgrtagr.betas)<-colnames(X.amgrtagr)
+hros.amgrtagr.betas
+
+# Re-introduce samples with AMMA & TAGR
+MORA.ammatagr <- filter(MORA.Len.df, AMGR == 0) # remove samples with AMMA present
+X.ammatagr <- MORA.ammatagr[ , -c(1,2) ] # remove Sample (factor) column and unused predator columns
+X.ammatagr <- as.matrix(sapply(X.ammatagr, as.numeric))  # convert to matrix
+
+hros.ammatagr <- rosalia(X.ammatagr)# run rosalia function (with no prior)
+hros.ammatagr.betas<-hros.ammatagr$beta # returns 'interaction strengths'
+colnames(hros.ammatagr.betas)<-colnames(X.ammatagr)
+rownames(hros.ammatagr.betas)<-colnames(X.ammatagr)
+hros.ammatagr.betas
+
+# Resulting networks
+#hros.anurans.betas # anuran guild (no predators)
+#hros.amgr.betas # anuran guild + AMGR
+#hros.amma.betas # anuran guild + AMMA
+#hros.tagr.betas # anuran guild + TAGR
+#hros.ammaamgr.betas # anuran guild + AMGR & AMMA
+#hros.ammatagr.betas # anuran guild + AMMA & TAGR
+#hros.amgrtagr.betas # anuran guild + AMGR & TAGR
+#hros.A # original Markov network (full community)
+#competition_stronger_rainier # the known interactions from the competitor-dominated network
+
+# Take JUST the interactions for the anuran guild from each of these matrices
+hros.anurans.betas # anuran guild (no predators) 
+
+hros.amgr.betas # anuran guild + AMGR, 
+anurans.amgr <- hros.amgr.betas[ -1, -1]
+
+hros.amma.betas # anuran guild + AMMA
+anurans.amma <- hros.amma.betas[ -1, -1]
+
+hros.tagr.betas # anuran guild + TAGR
+anurans.tagr <- hros.tagr.betas[ -5, -5]
+
+hros.ammaamgr.betas # anuran guild + AMGR & AMMA
+anurans.ammaamgr <- hros.ammaamgr.betas[ -c(1,2), -c(1,2)]
+
+hros.ammatagr.betas # anuran guild + AMMA & TAGR
+anurans.ammatagr <- hros.ammatagr.betas[ -c(1,6), -c(1,6)]
+
+hros.amgrtagr.betas # anuran guild + AMGR & TAGR
+anurans.amgrtagr <- hros.amgrtagr.betas[ -c(1,6), -c(1,6)]
+
+hros.A # full comunity
+anurans.full <- hros.A[ -c(1,2,7), -c(1,2,7)]
+
+competition_stronger_rainier # known interactions (full community)
+anurans.known <- competition_stronger_rainier[ -c(1,2,7), -c(1,2,7)]
+
+
+# Final list of anuran interactions only, in the different community contexts
+anurans.known # just the anurans from the competitor-dominated network
+anurans.full # just the anurans from original markov network (full community with predators)
+hros.anurans.betas # anuran guild (no predators)
+anurans.amgr # anuran guild + AMGR
+anurans.amma # anuran guild + AMMA
+anurans.tagr # anuran guild + TAGR
+anurans.ammaamgr # anuran guild + AMGR & AMMA
+anurans.ammatagr # anuran guild + AMMA & TAGR
+anurans.amgrtagr # anuran guild + AMGR & TAGR
+```
+
+#### Calculate  network statistics (guild test)
+
+```{r}
+#Convert to adjacency matrices
+anuranbetas.list <- list(anurans.known, hros.anurans.betas, anurans.amgr, anurans.amma, anurans.tagr, 
+                         anurans.ammaamgr, anurans.ammatagr, anurans.amgrtagr, anurans.full)
+
+anuranadj.list<-list()
+for(i in 1:length(anuranbetas.list)) {
+  anuranadj <- matrix(, nrow = 4, ncol = 4) # create an empty 4 x 4  matrix
+  anuranadj[anuranbetas.list[[i]] < 0 ] = -1 # if less than 0, then -1
+  anuranadj[anuranbetas.list[[i]] > 0 ] = 1 # if greater than 0, then 1
+  anuranadj[anuranbetas.list[[i]] == 0 ] = 0 # if 0, then 0
+  colnames(anuranadj)<-colnames(anuranbetas.list[[i]]) 
+  rownames(anuranadj)<-colnames(anuranbetas.list[[i]])
+  anuranadj.list[[i]]<- anuranadj
+}
+# anuranadj.list[[9]]
+
+anuranadj.list
+mat_list_names<-c("known.anurans","anurans","anurans.amgr","anurans.amma","anurans.tagr","anurans.ammaamgr",
+                  "anurans.ammatagr","anurans.amgrtagr","anurans.full")
+names(anuranadj.list)<-mat_list_names
+
+# create a graph
+graph_list_nd<-lapply(anuranadj.list, graph.adjacency, mode="directed", weighted=TRUE, diag=FALSE)
+
+# get a metaweb of all interactions
+metaweb(graph_list_nd) 
+
+# compare turnover
+(net_beta_1<-network_betadiversity_new(graph_list_nd)) # using modified network_betadiversity() function
+#guild_net_betas<-as.data.frame(net_beta_1)
+#write.csv(guild_net_betas, "guild_net_betasv2.csv")
+```
+
+#### Plotting guild test networks
+
+```{r}
+# Anuran interactions only, in the different community contexts
+#anurans.known # just the anurans from the competitor-dominated network
+#hros.anurans.betas # anuran guild (no predators)
+#anurans.amgr # anuran guild + AMGR
+#anurans.amma # anuran guild + AMMA
+#anurans.tagr # anuran guild + TAGR
+#anurans.ammaamgr # anuran guild + AMGR & AMMA
+#anurans.ammatagr # anuran guild + AMMA & TAGR
+#anurans.amgrtagr # anuran guild + AMGR & TAGR
+#anurans.full # just the anurans from original markov network (full community with all 3 predators)
+
+
+layout(matrix(c(1,2,3,4,5,1,6,7,8,9), 2, 5, byrow = TRUE))
+par(mar=c(5,5,5,5), oma=c(1,0,1,0))
+#par(mfrow=c(2,5))
+
+# Plot known competitive interactions
+g<-graph.adjacency(anurans.known, mode="directed",weighted=TRUE,diag=FALSE)
+l<-layout.circle(g) 
+l<- layout.norm(l, ymin=-1, ymax=1, xmin=-1, xmax=1) 
+deg<-5 
+V(g)$size<-deg 
+E(g)$width<-(abs(E(g)$weight)/max(abs(E(g)$weight)))*2
+E(g)[E(g)$weight<0]$color<-"red"  # red for negative interactions
+E(g)[E(g)$weight>0]$color<-"blue" # blue for positive interactions. 
+V(g)$color <- "gray80"
+V(g)$label.cex <-1.25
+lab.locs <- radian.rescale(x=1:4, direction=-1, start=0) # 4 = number of nodes
+plot(g, rescale=FALSE, 
+     layout=l*1.05,
+     #vertex.size=2, 
+     vertex.label.dist=5, 
+     vertex.label.degree=lab.locs, 
+     vertex.color="gray80",
+     vertex.label.color="black",
+     edge.curved=.05,
+     edge.arrow.size=0.25,
+     vertex.label.family="sans") 
+mtext(text = "Known competitive\ninteractions",side = 3,line = -10, cex=1.5)
+
+# Anuran Guild
+g<-graph.adjacency(hros.anurans.betas, mode="directed",weighted=TRUE,diag=FALSE)
+l<-layout.circle(g) 
+l<- layout.norm(l, ymin=-1, ymax=1, xmin=-1, xmax=1) 
+deg<-5 
+V(g)$size<-deg 
+E(g)$width<-(abs(E(g)$weight)/max(abs(E(g)$weight)))*8
+E(g)[E(g)$weight<0]$color<-"red"  # red for negative interactions
+E(g)[E(g)$weight>0]$color<-"blue" # blue for positive interactions. 
+V(g)$color <- "gray80"
+V(g)$label.cex <-1.25
+lab.locs <- radian.rescale(x=1:4, direction=-1, start=0) # 4 = number of nodes
+plot(g, rescale=FALSE, 
+     layout=l*1.05,
+     #vertex.size=2, 
+     vertex.label.dist=5, 
+     vertex.label.degree=lab.locs, 
+     vertex.color="gray80",
+     vertex.label.color="black",
+     edge.curved=.05,
+     edge.arrow.size=0.25,
+     vertex.label.family="sans") 
+mtext(text = "Anuran Guild",side = 3,line = 3, cex=1.5)
+
+# + AMGR
+g<-graph.adjacency(anurans.amgr, mode="directed",weighted=TRUE,diag=FALSE)
+l<-layout.circle(g) 
+l<- layout.norm(l, ymin=-1, ymax=1, xmin=-1, xmax=1) 
+deg<-5 
+V(g)$size<-deg 
+E(g)$width<-(abs(E(g)$weight)/max(abs(E(g)$weight)))*8
+E(g)[E(g)$weight<0]$color<-"red"  # red for negative interactions
+E(g)[E(g)$weight>0]$color<-"blue" # blue for positive interactions. 
+V(g)$color <- "gray80"
+V(g)$label.cex <-1.25
+lab.locs <- radian.rescale(x=1:4, direction=-1, start=0) # 4 = number of nodes
+plot(g, rescale=FALSE, 
+     layout=l*1.05,
+     #vertex.size=2, 
+     vertex.label.dist=5, 
+     vertex.label.degree=lab.locs, 
+     vertex.color="gray80",
+     vertex.label.color="black",
+     edge.curved=.05,
+     edge.arrow.size=0.25,
+     vertex.label.family="sans") 
+mtext(text = "+ AMGR",side = 3,line = 3, cex=1.5)
+
+# + AMMA
+g<-graph.adjacency(anurans.amma, mode="directed",weighted=TRUE,diag=FALSE)
+l<-layout.circle(g) 
+l<- layout.norm(l, ymin=-1, ymax=1, xmin=-1, xmax=1) 
+deg<-5 
+V(g)$size<-deg 
+E(g)$width<-(abs(E(g)$weight)/max(abs(E(g)$weight)))*8
+E(g)[E(g)$weight<0]$color<-"red"  # red for negative interactions
+E(g)[E(g)$weight>0]$color<-"blue" # blue for positive interactions. 
+V(g)$color <- "gray80"
+V(g)$label.cex <-1.25
+lab.locs <- radian.rescale(x=1:4, direction=-1, start=0) # 4 = number of nodes
+plot(g, rescale=FALSE, 
+     layout=l*1.05,
+     #vertex.size=2, 
+     vertex.label.dist=5, 
+     vertex.label.degree=lab.locs, 
+     vertex.color="gray80",
+     vertex.label.color="black",
+     edge.curved=.05,
+     edge.arrow.size=0.25,
+     vertex.label.family="sans") 
+mtext(text = "+ AMMA",side = 3,line = 3, cex=1.5)
+
+# + TAGR
+g<-graph.adjacency(anurans.tagr, mode="directed",weighted=TRUE,diag=FALSE)
+l<-layout.circle(g) 
+l<- layout.norm(l, ymin=-1, ymax=1, xmin=-1, xmax=1) 
+deg<-5 
+V(g)$size<-deg 
+E(g)$width<-(abs(E(g)$weight)/max(abs(E(g)$weight)))*8
+E(g)[E(g)$weight<0]$color<-"red"  # red for negative interactions
+E(g)[E(g)$weight>0]$color<-"blue" # blue for positive interactions. 
+V(g)$color <- "gray80"
+V(g)$label.cex <-1.25
+lab.locs <- radian.rescale(x=1:4, direction=-1, start=0) # 4 = number of nodes
+plot(g, rescale=FALSE, 
+     layout=l*1.05,
+     #vertex.size=2, 
+     vertex.label.dist=5, 
+     vertex.label.degree=lab.locs, 
+     vertex.color="gray80",
+     vertex.label.color="black",
+     edge.curved=.05,
+     edge.arrow.size=0.25,
+     vertex.label.family="sans") 
+mtext(text = "+ TAGR",side = 3,line = 3, cex=1.5)
+
+# + AMGR & AMMA
+g<-graph.adjacency(anurans.ammaamgr, mode="directed",weighted=TRUE,diag=FALSE)
+l<-layout.circle(g) 
+l<- layout.norm(l, ymin=-1, ymax=1, xmin=-1, xmax=1) 
+deg<-5 
+V(g)$size<-deg 
+E(g)$width<-(abs(E(g)$weight)/max(abs(E(g)$weight)))*8
+E(g)[E(g)$weight<0]$color<-"red"  # red for negative interactions
+E(g)[E(g)$weight>0]$color<-"blue" # blue for positive interactions. 
+V(g)$color <- "gray80"
+V(g)$label.cex <-1.25
+lab.locs <- radian.rescale(x=1:4, direction=-1, start=0) # 4 = number of nodes
+plot(g, rescale=FALSE, 
+     layout=l*1.05,
+     #vertex.size=2, 
+     vertex.label.dist=5, 
+     vertex.label.degree=lab.locs, 
+     vertex.color="gray80",
+     vertex.label.color="black",
+     edge.curved=.05,
+     edge.arrow.size=0.25,
+     vertex.label.family="sans") 
+mtext(text = "+ AMGR & AMMA",side = 3,line = 3, cex=1.5)
+
+# + AMMA & TAGR
+g<-graph.adjacency(anurans.ammatagr, mode="directed",weighted=TRUE,diag=FALSE)
+l<-layout.circle(g) 
+l<- layout.norm(l, ymin=-1, ymax=1, xmin=-1, xmax=1) 
+deg<-5 
+V(g)$size<-deg 
+E(g)$width<-(abs(E(g)$weight)/max(abs(E(g)$weight)))*8
+E(g)[E(g)$weight<0]$color<-"red"  # red for negative interactions
+E(g)[E(g)$weight>0]$color<-"blue" # blue for positive interactions. 
+V(g)$color <- "gray80"
+V(g)$label.cex <-1.25
+lab.locs <- radian.rescale(x=1:4, direction=-1, start=0) # 4 = number of nodes
+plot(g, rescale=FALSE, 
+     layout=l*1.05,
+     #vertex.size=2, 
+     vertex.label.dist=5, 
+     vertex.label.degree=lab.locs, 
+     vertex.color="gray80",
+     vertex.label.color="black",
+     edge.curved=.05,
+     edge.arrow.size=0.25,
+     vertex.label.family="sans") 
+mtext(text = "+ AMMA & TAGR",side = 3,line = 3, cex=1.5)
+
+# + AMGR & TAGR
+g<-graph.adjacency(anurans.amgrtagr, mode="directed",weighted=TRUE,diag=FALSE)
+l<-layout.circle(g) 
+l<- layout.norm(l, ymin=-1, ymax=1, xmin=-1, xmax=1) 
+deg<-5 
+V(g)$size<-deg 
+E(g)$width<-(abs(E(g)$weight)/max(abs(E(g)$weight)))*8
+E(g)[E(g)$weight<0]$color<-"red"  # red for negative interactions
+E(g)[E(g)$weight>0]$color<-"blue" # blue for positive interactions. 
+V(g)$color <- "gray80"
+V(g)$label.cex <-1.25
+lab.locs <- radian.rescale(x=1:4, direction=-1, start=0) # 4 = number of nodes
+plot(g, rescale=FALSE, 
+     layout=l*1.05,
+     #vertex.size=2, 
+     vertex.label.dist=5, 
+     vertex.label.degree=lab.locs, 
+     vertex.color="gray80",
+     vertex.label.color="black",
+     edge.curved=.05,
+     edge.arrow.size=0.25,
+     vertex.label.family="sans") 
+mtext(text = "+ AMGR & TAGR",side = 3,line = 3, cex=1.5)
+
+# with all 3 predators
+g<-graph.adjacency(anurans.full, mode="directed",weighted=TRUE,diag=FALSE)
+l<-layout.circle(g) 
+l<- layout.norm(l, ymin=-1, ymax=1, xmin=-1, xmax=1) 
+deg<-5 
+V(g)$size<-deg 
+E(g)$width<-(abs(E(g)$weight)/max(abs(E(g)$weight)))*8
+E(g)[E(g)$weight<0]$color<-"red"  # red for negative interactions
+E(g)[E(g)$weight>0]$color<-"blue" # blue for positive interactions. 
+V(g)$color <- "gray80"
+V(g)$label.cex <-1.25
+lab.locs <- radian.rescale(x=1:4, direction=-1, start=0) # 4 = number of nodes
+plot(g, rescale=FALSE, 
+     layout=l*1.05,
+     #vertex.size=2, 
+     vertex.label.dist=5, 
+     vertex.label.degree=lab.locs, 
+     vertex.color="gray80",
+     vertex.label.color="black",
+     edge.curved=.05,
+     edge.arrow.size=0.25,
+     vertex.label.family="sans") 
+mtext(text = "Full",side = 3,line = 3, cex=1.5)
+```
+
+# TEST OF SCALE-DEPENDENCY
+
+## Aggregate communities to larger spatial grain sizes, based on their spatial location on the landscape.
+
+``` {r  Scale test, include=TRUE, eval=FALSE}
+MORA.Lentic <- read.csv("MORA_Amphibians_Lentic_CSV_033117.csv", header=T) # previously loaded in Methods Comparison
+#str(MORA.Lentic)
+
+# convert buffer variables to factors
+MORA.Lentic$Buffer_125m<-as.factor(MORA.Lentic$Buffer_125m) 
+MORA.Lentic$Buffer_250m<-as.factor(MORA.Lentic$Buffer_250m)
+MORA.Lentic$Buffer_500m<-as.factor(MORA.Lentic$Buffer_500m)
+MORA.Lentic$Buffer_1km<-as.factor(MORA.Lentic$Buffer_1km)
+
+## Need to create new "samples" (observations by site and year) since sites are
+## being aggregated across four distinct spatial scales. 
+
+# Since each of the Buffer variables contain integers (now factors) to indicate the unique, aggregated sites, have to distinguish the integers in each column. Because a 1 in one column does not indicate the same group of sites as a 1 in another column.
+MORA.Lentic$Buffer_125m<-paste("B125m", MORA.Lentic$Buffer_125m, sep=".")
+MORA.Lentic$Buffer_250m<-paste("B250m", MORA.Lentic$Buffer_250m, sep=".")
+MORA.Lentic$Buffer_500m<-paste("B500m", MORA.Lentic$Buffer_500m, sep=".")
+MORA.Lentic$Buffer_1km<-paste("B1km", MORA.Lentic$Buffer_1km, sep=".")
+
+# Create a new column "Sample_[X]Buff" for each observation that merges the site (now indicated by "Buffer_[X]") and Year
+MORA.Lentic$Sample_125m = paste(MORA.Lentic$Buffer_125m, MORA.Lentic$Year, sep="_") # Sites linked by a buffer distance of 125 m (i.e. nearest neighbor within 250 m)
+
+MORA.Lentic$Sample_250m = paste(MORA.Lentic$Buffer_250m, MORA.Lentic$Year, sep="_") # Sites linked by a buffer distance of 250 m (500 m nearest neighbor)
+
+MORA.Lentic$Sample_500m = paste(MORA.Lentic$Buffer_500m, MORA.Lentic$Year, sep="_") # Sites linked by a buffer distance of 500 m (1 km nearest neighbor)
+
+MORA.Lentic$Sample_1km = paste(MORA.Lentic$Buffer_1km, MORA.Lentic$Year, sep="_") # Sites linked by a buffer distance of 1 km (2 km nearest neighbor)
+
+
+## Create new community matrices for each of these new sample-buffer columns.  
+
+# 125m buffer: columns 4 (Species) and 23 (Samples at the 125-m buffer distance) of 26
+# Step 1: reduce the dataframe to just columns of Sample and SpeciesCod
+MORA.Lentic2 <- MORA.Lentic[ , -c(1:3,5:22,24:26) ] # 4738 observations (all samples)
+# Step 2: make the boolean matrix   
+w <- melt(MORA.Lentic2) # 4738 observations (all samples), doesn't really change anything
+w <- dcast(w, Sample_125m~SpeciesCod) # 477 samples (aggregated)
+w[is.na(w)] <- 0        # assigns all NA values a 0
+w2 <- cbind(apply(w[,2:8], 2, function(w) as.numeric(w > 0)), w[1])  # 7 species columns; recode as 0/1; applies function only to numeric columns; binds first column (Sample) 
+MORA.matrix.125m <- w2[,c(8, 1:7)]  # rearrange so that Sample_125m column is first
+
+
+# 250m buffer: columns 4 (Species) and 24 (Samples at the 250-m buffer distance) of 26
+MORA.Lentic3 <- MORA.Lentic[ , -c(1:3,5:23,25:26) ] # 4738 observations (all samples)
+w <- melt(MORA.Lentic3) # 4738 observations (all samples)
+w <- dcast(w, Sample_250m~SpeciesCod) # 394 samples (aggregated)
+w[is.na(w)] <- 0        # assigns all NA values a 0
+w2 <- cbind(apply(w[,2:8], 2, function(w) as.numeric(w > 0)), w[1])  # 7 species columns; recode as 0/1; applies function only to numeric columns; binds first column (Sample) 
+MORA.matrix.250m <- w2[,c(8, 1:7)]  # rearrange so that Sample_250m column is first
+
+# 500m buffer: columns 4 (Species) and 25 (Samples at the 500-m buffer distance) of 26
+MORA.Lentic4 <- MORA.Lentic[ , -c(1:3,5:24,26) ] # 4738 observations (all samples)
+w <- melt(MORA.Lentic4) # 4738 observations (all samples)
+w <- dcast(w, Sample_500m~SpeciesCod) # 300 samples (aggregated)
+w[is.na(w)] <- 0        # assigns all NA values a 0
+w2 <- cbind(apply(w[,2:8], 2, function(w) as.numeric(w > 0)), w[1])  # 7 species columns; recode as 0/1; applies function only to numeric columns; binds first column (Sample)  
+MORA.matrix.500m <- w2[,c(8, 1:7)]  # rearrange so that Sample_500m column is first
+
+# 1km buffer: columns 4 (Species) and 26 (Samples at the 1-lm buffer distance) of 26
+MORA.Lentic5 <- MORA.Lentic[ , -c(1:3,5:25) ] # 4738 observations (all samples)
+w <- melt(MORA.Lentic5) # 4738 observations (all samples), doesn't really change anything
+w <- dcast(w, Sample_1km~SpeciesCod) # 209 samples (aggregated)
+w[is.na(w)] <- 0        # assigns all NA values a 0
+w2 <- cbind(apply(w[,2:8], 2, function(w) as.numeric(w > 0)), w[1]) # 7 species columns; recode as 0/1; applies function only to numeric columns; binds first column (Sample)   
+MORA.matrix.1km <- w2[,c(8, 1:7)]  # rearrange so that Sample_1km column is first
+
+# Community matrices at each of the spatial scales:
+X # the main community matrix without any changes to spatial scales (sample column already removed for analyses)
+MORA.matrix.125m
+MORA.matrix.250m
+MORA.matrix.500m
+MORA.matrix.1km
+
+X.125m <- MORA.matrix.125m[ , -1 ] # remove Sample column
+X.250m <- MORA.matrix.250m[ , -1 ] 
+X.500m <- MORA.matrix.500m[ , -1 ] 
+X.1km <- MORA.matrix.1km[ , -1 ] 
+
+# run rosalia function (with no priors)
+hros <- rosalia(X)
+hros.125m <- rosalia(X.125m)
+hros.250m <- rosalia(X.250m)
+hros.500m <- rosalia(X.500m)
+hros.1km <- rosalia(X.1km)
+
+# returns 'interaction strengths'
+hros.betas<-hros$beta
+hros.125m.beta<-hros.125m$beta
+hros.250m.beta<-hros.250m$beta
+hros.500m.beta<-hros.500m$beta
+hros.1km.beta<-hros.1km$beta
+
+colnames(hros.betas)<-colnames(X) 
+rownames(hros.betas)<-colnames(X)
+colnames(hros.125m.beta)<-colnames(X.125m) 
+rownames(hros.125m.beta)<-colnames(X.125m)
+colnames(hros.250m.beta)<-colnames(X.250m) 
+rownames(hros.250m.beta)<-colnames(X.250m)
+colnames(hros.500m.beta)<-colnames(X.500m) 
+rownames(hros.500m.beta)<-colnames(X.500m)
+colnames(hros.1km.beta)<-colnames(X.1km) 
+rownames(hros.1km.beta)<-colnames(X.1km)
+
+
+# Convert to adjacncy matrices (1/0)
+betas_list<-list(hros.betas, hros.125m.beta, hros.250m.beta, hros.500m.beta, hros.1km.beta)
+hrosadj.list <- list()
+
+for(i in 1: length(betas_list)) {
+  adj.matrix <-  matrix(, nrow = 7, ncol = 7) # create an empty 7 x 7  matrix
+  adj.matrix[betas_list[[i]] < 0 ] = -1 # if less than 0, then -1
+  adj.matrix[betas_list[[i]] > 0 ] = 1 # if greater than 0, then 1
+  adj.matrix[betas_list[[i]] == 0 ] = 0 # if 0, then 0
+  colnames(adj.matrix)<-colnames(betas_list[[i]]) 
+  rownames(adj.matrix)<-colnames(betas_list[[i]])
+  hrosadj.list[[i]]<-adj.matrix
+  
+}
+hrosadj.list
+
+# add in the adjacency matrices from the known interaction networks to this list
+hrosadj.list[[6]]<-competition_stronger_rainier
+hrosadj.list[[7]]<-predation_stronger_rainier
+
+mat_list_names<-c("hros.adj", "hros.125m.adj", "hros.250m.adj", "hros.500m.adj", "hros.1km.adj", "competition.stronger", "predation.stronger")
+
+names(hrosadj.list)<-mat_list_names
+
+# Network statistics (scale test)
+
+# Make a graph
+graph_list<-lapply(hrosadj.list, graph.adjacency, mode="directed", weighted=TRUE, diag=FALSE)
+
+# get a metaweb of all interactions
+metaweb(graph_list) 
+
+# compare turnover using the modified betalink function (embedded in network_betadiversity)
+(net_beta_1<-network_betadiversity_new(graph_list)) # using modified network_betadiversity() function
+
+#spatial_net_betas<-as.data.frame(net_beta_1)
+#write.csv(spatial_net_betas, "spatial_net_betasv2.csv")
+
+# what interaction pairs are consistently identified? 
+# convert adj matrices to pairwise distances
+hrosdist.list <- list()
+
+for(j in 1: length(hrosadj.list)) {
+  hros.dist <- t(combn(colnames(hrosadj.list[[j]]), 2))
+  hros.dist<-data.frame(hros.dist, dist=hrosadj.list[[j]][hros.dist])
+  colnames(hros.dist)[1] <- "sp1"
+  colnames(hros.dist)[2] <- "sp2"
+  hrosdist.list[[j]] <- hros.dist
+}
+}
+hrosdist.list
+mat_list_names<-c("hros.dist", "hros.125m.dist", "hros.250m.dist", "hros.500m.dist", "hros.1km.dist", "competition.dist", "predation.dist")
+names(hrosdist.list)<-mat_list_names
+
+
+hros.dist.list <-list(hros.dist,hros.dist.125m,hros.dist.250m,hros.dist.500m,hros.dist.1km)
+tmp <- do.call(cbind, lapply(hrosdist.list, function(x) x[,-(1:2)])) # merge all of the dataframes, except for the first 2 rows containing species names
+all_intxns <- cbind(hrosdist.list[[1]][,1:2], tmp) # add in the species columns
+#betas_across_scales<-as.data.frame(all_intxns)
+
+# tallying the frequency of negative vs. positive interactions for each species pair across scales
+mat<-matrix(nrow=7,ncol=7) # size of matrix is richness of the community (all possible involved species)
+colnames(mat)<-colnames(X) # name matrix rows & columns wtih species names from MORA community matrix
+rownames(mat)<-colnames(X)
+mat[upper.tri(mat)]<-1
+dat <- as.data.frame(mat)
+value <- stack(dat)$values
+rnames <- rownames(dat)
+namecol <- expand.grid(rnames, rnames)
+colnames(namecol) <- c("col", "row")
+res <- data.frame(namecol, value) # make dataframe of names of all possible species pairs (n = 49 = 7 * 7)
+res2<-res[complete.cases(res$value),] # i did this part to get all the possible UNDIRECTED species pairs
+nrow(res);nrow(res2) # 49; 21
+res2 # all the possible pairs (undirected)
+
+# how many times does each interaction occur in each dataset
+for (i in 1:length(hrosdist.list)){
+  tmp<-hrosdist.list[[i]]
+  for (j in 1:nrow(res2)){
+    res2[j,i+3]<-ifelse(length(which(as.character(tmp[,1])==as.character(res2$col[j])
+                                     &as.character(tmp[,2])==as.character(res2$row[j])))>0, 
+                        tmp[which(as.character(tmp[,1])==as.character(res2$col[j])
+                                  &as.character(tmp[,2])==as.character(res2$row[j])),3],
+                        ifelse(length(which(as.character(tmp[,1])==as.character(res2$row[j])
+                                            &as.character(tmp[,2])==as.character(res2$col[j])))>0, 
+                               tmp[which(as.character(tmp[,1])==as.character(res2$row[j])
+                                         &as.character(tmp[,2])==as.character(res2$col[j])),3], 
+                               NA))
+  }
+}
+res3<-abs(res2[,4:ncol(res2)])
+res3[is.na(res3)]<-0
+res3<-decostand(res3,method="pa") # convert to 0, 1 because just going to tally here
+res3
+
+res4<-data.frame(res2[,1:2],res3)
+res4$tally<-rowSums(res4[,3:ncol(res4)]) # counts number of times that an interaction was seen across all cooc methods
+
+res4_ordered<-res4[order(res4$tally, decreasing=TRUE),] # order by tally
+res4_ordered
+sum(nrow(res4_ordered)) # 21 significant pairs
+# all species pairs found across scales (obviously because estimates are given for all pairs in markov models)
+
+# the previous tallies didn't account for differences in the SIGN of the interaction among methods
+# how many times was an interaction identified with same SIGN across datasets?
+res5<-res2
+res5[is.na(res5)]<-0
+res6<-apply(res5[,4:ncol(res5)], 2, function(x) ifelse(x>0,1,ifelse(x<0,-1,0)))
+rowSums(abs(res6))==res4$tally # just checking
+res6<-data.frame(res6)
+res6$tallypos <- apply(res6[,1:ncol(res6)], 1 , function(x) sum(x>0))
+res6$tallyneg <- apply(res6[,1:ncol(res6)], 1 , function(x) sum(x<0))
+res7<-data.frame(res2[,1:2],res6)
+colnames(res7)[3:9]<-mat_list_names
+res7
+```
+
+Analyze the proportion of positives at larger grain sizes.
+
+```{r}
+hros <- rosalia(X)
+hros.125m <- rosalia(X.125m)
+hros.250m <- rosalia(X.250m)
+hros.500m <- rosalia(X.500m)
+hros.1km <- rosalia(X.1km)
+```
+
+
+## Spatially aggregate with EXACT distribution
+
+To isolate the "spatial" vs. "aspatial" effect of increasing spatial grain size, use the same distribution of sites aggregated on the landscape to randomly aggregate sites (e.g., the "aspatial" effect of grain size on associations)
+
+```{r}
+MORA.Lentic %>%
+  select(Sample_125m:Sample_1km) %>%
+  gather(Sample_125m:Sample_1km, key = "grain_size", value = "sample_id") %>%
+  group_by(grain_size, sample_id) %>%
+  summarise(group_n = n()) -> mora_exact_groups
+mora_exact_groups_list <- split(mora_exact_groups, mora_exact_groups$grain_size)
+
+as_tibble(MORA.Lentic) %>%
+  mutate(SpeciesCod = as.character(SpeciesCod)) %>%
+  select(ObjectID, SpeciesCod) %>%
+  mutate(occurrence = 1) %>%
+  spread(key = SpeciesCod, value = occurrence, fill = 0) %>%
+  select(-ObjectID) -> ML_speciesonly
+
+# if aggregating multiple times, need to draw without replacement
+row_aggregate_exact <- function(group_n) {
+  
+  # get expanded group ID
+  data.frame(group_n = group_n, 
+             stringsAsFactors = FALSE) %>%
+    mutate(group_id = paste0("id_",(seq(from = 1, to = n())))) %>%
+    do(data.frame(group_id = .[rep(1:nrow(.), .$group_n),-1], 
+                  stringsAsFactors = FALSE)) -> expanded_gn
+  
+  # make an index based on row numbers
+  N <- nrow(ML_speciesonly)
+  N_randomized <- sample(x = 1:N, size = N, replace = FALSE)
+  N_groups <- expanded_gn$group_id
+  
+  Y <- split(N_randomized, N_groups)
+  
+  map(.x = Y, .f = function(z) {
+    x_sum <- colSums(ML_speciesonly[z, ])
+    return(ifelse(x_sum > 0, 1, 0))
+    }) %>%
+    map(as.list) %>%
+    map(as.tibble) %>%
+    bind_rows() -> df_return
+  
+  # convert to right object
+  return(as.matrix(df_return))
+}
+```
+
+Aggregate with exact distributions.
+
+```{r}
+agg_list_125 <- replicate(n = n_rand, 
+                  expr = row_aggregate_exact(group_n = mora_exact_groups_list[[1]]$group_n), 
+                          simplify = FALSE)
+agg_list_125 %>%
+  map(.f = markov_wrapper) -> agg_output_125
+
+
+agg_list_250 <- replicate(n = n_rand, 
+                  expr = row_aggregate_exact(group_n = mora_exact_groups_list[[3]]$group_n), 
+                          simplify = FALSE)
+agg_list_250 %>%
+  map(.f = markov_wrapper) -> agg_output_250
+
+
+agg_list_500 <- replicate(n = n_rand, 
+                  expr = row_aggregate_exact(group_n = mora_exact_groups_list[[4]]$group_n), 
+                          simplify = FALSE)
+agg_list_500 %>%
+  map(.f = markov_wrapper) -> agg_output_500
+
+
+agg_list_1000 <- replicate(n = n_rand, 
+                  expr = row_aggregate_exact(group_n = mora_exact_groups_list[[2]]$group_n), 
+                          simplify = FALSE)
+agg_list_1000 %>%
+  map(.f = markov_wrapper) -> agg_output_1000
+
+```
+
+Analyze.
+
+```{r}
+map(agg_output_125, prop_sign) %>%
+  bind_rows() -> prop_125
+map(agg_output_250, prop_sign) %>%
+  bind_rows() -> prop_250
+map(agg_output_500, prop_sign) %>%
+  bind_rows() -> prop_500
+map(agg_output_1000, prop_sign) %>%
+  bind_rows() -> prop_1000
+
+# what is the proportion in the original?
+prop_original <- prop_sign(hros.A)
+
+hros.betas<-hros$beta
+hros.125m.beta<-hros.125m$beta
+hros.250m.beta<-hros.250m$beta
+hros.500m.beta<-hros.500m$beta
+hros.1km.beta<-hros.1km$beta
+
+prop_o <- prop_sign(hros.betas)
+prop_o_125 <- prop_sign(hros.125m.beta)
+prop_o_250 <- prop_sign(hros.250m.beta)
+prop_o_500 <- prop_sign(hros.500m.beta)
+prop_o_1000 <- prop_sign(hros.1km.beta)
+
+# bind everything together
+list(prop_125 = prop_125,
+     prop_250 = prop_250,
+     prop_500 = prop_500,
+     prop_1000 = prop_1000,
+     prop_o_125 = prop_o_125,
+     prop_o_250 = prop_o_250,
+     prop_o_500 = prop_o_500,
+     prop_o_1000 = prop_o_1000) %>%
+  bind_rows(.id = "id") -> prop_total_exact
+```
+
+Plot.
+
+```{r}
+prop_total_exact %>%
+  mutate(aggregate_size = ifelse(id == "prop_125", 125,
+                                 ifelse(id == "prop_250", 250, 
+                                        ifelse(id == "prop_500", 500,  
+                                               ifelse(id == "prop_1000", 1000,
+              ifelse(id == "prop_o_125", 125,
+                     ifelse(id=="prop_o_250", 250,
+                            ifelse(id=="prop_o_500", 500, 1000)))))))) %>%
+  mutate(prop_positive = n_positive/n_total,
+         prop_negative = n_negative/n_total) %>%
+  mutate(original = ifelse(str_sub(id, 
+                                   start = 1, 
+                                   end = 6) == "prop_o", 
+                           "yes", "no")) -> prop_total_analysis_exact
+
+# plot 
+prop_total_analysis_exact %>%
+  rename(Negative = "prop_negative", Positive = "prop_positive") %>%
+  gather(Negative, Positive, key = "sign", value = "prop") %>%
+  mutate(aggregate_size = aggregate_size * 2) %>%
+  filter(original == "yes") -> plot_orig_exact
+
+png(filename = "proportion_pos_neg_random_aggregation.png", width = 8, height = 4, units = "in", res=300)
+prop_total_analysis_exact %>%
+  rename(Negative = "prop_negative", Positive = "prop_positive") %>%
+  gather(Negative, Positive, key = "sign", value = "prop") %>%
+  filter(original != "yes") %>%
+  mutate(aggregate_size = aggregate_size * 2) %>%
+  ggplot(aes(x = aggregate_size, y = prop)) +
+  geom_jitter(width = .5, height = (0.05625/2)) + 
+  facet_wrap(~ sign) +
+  labs(x = "Spatial scale of aggregation (meters)",
+       y = "Proportion of associations that are negative or positive") +
+  theme(legend.position = "none", panel.grid.minor = element_blank()) +
+  geom_point(data = plot_orig_exact, 
+             aes(x = aggregate_size, y = prop), size = 2, color = "red")
+dev.off()
+```
+
+Analyze.
+
+```{r}
+glm_2 <- glm(prop_positive ~ aggregate_size, family = "binomial", 
+             weights = n_total, data = prop_total_analysis_exact)
+summary(glm_2)
+plot(glm_1) # look at model assumptions
+```
+
+Make plot with aspatial patterns
+
+```{r}
+bind_rows(
+agg_output_125 %>%
+  map(as.table) %>%
+  map(as.data.frame, stringsAsFactors = FALSE) %>%
+  map(filter, Var1 != Var2) %>%
+  map(unite, Var1, Var2, col = "pair", sep = "-") %>%
+  map(rename, randomized_freq = Freq) %>%
+  map(mutate, scale = "hros.125m") %>%
+  bind_rows(.id = "replicate_aggregation"),
+agg_output_250 %>%
+  map(as.table) %>%
+  map(as.data.frame, stringsAsFactors = FALSE) %>%
+  map(filter, Var1 != Var2) %>%
+  map(unite, Var1, Var2, col = "pair", sep = "-") %>%
+  map(rename, randomized_freq = Freq) %>%
+  map(mutate, scale = "hros.250m") %>%
+  bind_rows(.id = "replicate_aggregation"),
+agg_output_500 %>%
+  map(as.table) %>%
+  map(as.data.frame, stringsAsFactors = FALSE) %>%
+  map(filter, Var1 != Var2) %>%
+  map(unite, Var1, Var2, col = "pair", sep = "-") %>%
+  map(rename, randomized_freq = Freq) %>%
+  map(mutate, scale = "hros.500m") %>%
+  bind_rows(.id = "replicate_aggregation"),
+agg_output_1000 %>%
+  map(as.table) %>%
+  map(as.data.frame, stringsAsFactors = FALSE) %>%
+  map(filter, Var1 != Var2) %>%
+  map(unite, Var1, Var2, col = "pair", sep = "-") %>%
+  map(rename, randomized_freq = Freq) %>%
+  map(mutate, scale = "hros.1km") %>%
+  bind_rows(.id = "replicate_aggregation")
+) -> agg_output_randomized
+
+scale_df_interactions %>%
+  mutate(randomized_freq = Freq) %>%
+  filter(scale_numeric > 0) -> scale_df_interactions_forplot
+
+
+png(filename = "pairwise_associations_scale_randomized.png", width = 7, height = 5, units = "in", res = 300)
+scale_df_interactions %>%
+  select(scale, pair, interaction, scale_numeric) %>%
+  right_join(agg_output_randomized) %>%
+  mutate(interaction = ifelse(is.na(interaction), "none", interaction)) %>%
+  mutate(empirical = ifelse(interaction == "none", "no", "yes")) %>%
+  unite(col = "pair_replicate", pair, replicate_aggregation, remove = FALSE) %>%
+  mutate(interaction = factor(interaction, levels = c("none", "competition", "predation",
+                                                      "predation and competition"))) %>%
+  ggplot(aes(x = scale_numeric, y = randomized_freq)) +
+  geom_line(aes(group = pair_replicate), alpha = 0.5, size = 0.5, color = "grey") +
+  geom_hline(yintercept = 0, linetype = 2, aes(size = 0.5)) +
+  
+  geom_line(data = scale_df_interactions_forplot, aes(group = pair)) +
+  geom_point(data = scale_df_interactions_forplot, aes(shape = interaction), size = 1.5) +
+  
+  
+  facet_wrap(~ interaction) + 
+  theme_bw() + 
+  theme(panel.grid.major = element_blank(), panel.grid.minor = element_blank(), 
+        strip.background = element_blank(), strip.text.x = element_blank()) +
+  labs(shape = "Type of Empirical Interaction", x = "Distance threshold for linking ponds, meters",
+       y = "Strength of estimated association, pairwise") +
+  scale_shape_manual(name = "Type of Empirical Interaction", values = c(16, 15, 17, 8))
+dev.off()
+```
+
+Plot distribution of sites
+
+```{r}
+png("figs7.png", width = 8, height = 6, units = "in", res = 300)
+mora_exact_groups %>%
+  mutate(scale_numeric = as.numeric(str_extract(grain_size, "(\\d)+")) * 2) %>% 
+  rowwise() %>%
+  mutate(scale_m = str_sub(grain_size, start = -2, end = -1)) %>%
+  ungroup() %>%
+  mutate(scale_fin = ifelse(scale_m == "km",
+                            paste(scale_numeric, "km"),
+                            paste(scale_numeric, "m"))) %>%
+  mutate(scale_fin = factor(scale_fin, levels = c("250 m",
+                                                  "500 m",
+                                                  "1000 m",
+                                                  "2 km"))) %>%
+  mutate(scale_fin = fct_recode(scale_fin, "1 km" = "1000 m")) %>%
+  ggplot(aes(x = group_n)) +
+  geom_histogram(binwidth = 5) +
+  facet_wrap(~scale_fin, scales = "free") +
+  theme_bw() + 
+  theme(panel.grid.minor = element_blank()) +
+  labs(x = "Number of sites included in one spatial aggregation,\nby overall grain size",
+       y = "Frequency")
+dev.off()
+```
+
+## References
+
+Allouche, O. et al. 2006. Assessing the accuracy of species distribution models, prevalence, kappy and the true skills statistic (TSS). *J. Applied Ecol.* 43: 1223-1232.  
+Harris, D. J. 2016. Inferring species interactions from co-occurrence data with Markov networks. *Ecology* 97: 3308-3314.  
+Pollock, L. J. et al. 2014. Understanding co-occurrence by modelling species simultaneously with a Joint Species Distribution Model (JSDM). *Methods Ecol. Evol.* 5: 397-406.  
+Sander, E. L. et al. 2017. Ecological Network Inference From Long-Term Presence-Absence Data. *Sci. Rep.* 7: 7154.  
+
+
+
+
+
+
+
+
+
+
+
+
